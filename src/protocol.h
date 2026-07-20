@@ -19,39 +19,36 @@
 #define PKT_MAGIC1 0xAA
 #define PKT_MAGIC2 0x03
 
-#define PKT_SAMPLE_LEN 48
-#define PKT_TELEM_LEN  56
-#define PKT_CONFIG_LEN 26
+#define PKT_SAMPLE_LEN 32
+#define PKT_TELEM_LEN  16
+#define PKT_CONFIG_LEN 20
 #define PKT_EVENT_TAG  0x09  // length is carried in the payload, not the tag
 
-// One lidar frame plus the platform orientation at the moment it arrived.
-// Self-contained on purpose: the host needs no interpolation to place the 8
-// points in the world, because the pose it wants is already attached.
+// One lidar frame plus the shaft angle at the moment it arrived. Self-contained
+// on purpose: the host needs no interpolation to place the 8 points in the
+// world, because the angle it wants is already attached.
+//
+// There is no orientation field. The lidar is bolted straight to the stepper
+// shaft and the shaft turns about the world vertical, so the step count *is*
+// the pose -- exactly, with no drift and nothing to fuse.
 struct __attribute__((packed)) PktSample {
   uint8_t  magic[4];
   uint32_t t_us;                       // micros() when the frame completed
-  float    qw, qx, qy, qz;             // AHRS quaternion, sensor->world
-  float    platformDeg;                // stepper-derived tilt, gearing applied
+  float    platformDeg;                // shaft angle, degrees about vertical
   uint16_t lidarSpeed;                 // lidar's own spin rate, 1/64 RPM
   uint16_t rawAngle;                   // uncalibrated frame start angle
   uint16_t dist[LIDAR_POINTS];         // raw words, bit 15 = no return
 };
 static_assert(sizeof(PktSample) == PKT_SAMPLE_LEN, "PktSample layout drifted");
 
-// Low-rate housekeeping. The raw accelerometer vector is here so the host can
-// verify which quaternion convention actually rotates gravity to world -Z
-// instead of the operator guessing (see scan_proto.resolve_frame).
-//
-// The orientation is repeated here as well as on every sample, because the
-// sample stream only exists while the lidar is spinning. A host that wants to
-// show live attitude -- or to tell a wedged AHRS from a wedged lidar -- needs
-// it from a source that keeps ticking when the lidar is silent.
+// Low-rate housekeeping. The angle is repeated here as well as on every sample,
+// because the sample stream only exists while the lidar is spinning: a host
+// that wants to show where the platform is sitting -- or to tell a wedged motor
+// from a wedged lidar -- needs it from a source that keeps ticking when the
+// lidar is silent.
 struct __attribute__((packed)) PktTelem {
   uint8_t  magic[4];
   uint32_t t_us;
-  float    ax, ay, az;                 // g
-  float    gx, gy, gz;                 // rad/s, bias-corrected
-  float    qw, qx, qy, qz;             // AHRS quaternion, sensor->world
   float    platformDeg;
   uint8_t  state;                      // ScanState
   uint8_t  reserved;
@@ -61,10 +58,9 @@ static_assert(sizeof(PktTelem) == PKT_TELEM_LEN, "PktTelem layout drifted");
 
 // Scan modes. Continuous is the original behaviour: the platform crosses the
 // whole sweep at a constant rate while the lidar streams. Stepped trades time
-// for quiet -- it moves, stops, lets the ringing die, averages the IMU with
-// the platform stationary, then captures with that one settled pose stamped on
-// every frame. The lidar's own vibration is still there, but it is no longer
-// being integrated into a pose that is moving at the same time.
+// for quiet -- it moves, stops, lets the ringing die, then captures with the
+// shaft genuinely stationary. The lidar's own vibration is still there, but the
+// angle stamped on a frame is no longer a moving target.
 #define SCAN_MODE_CONTINUOUS 0
 #define SCAN_MODE_STEPPED    1
 
@@ -75,12 +71,10 @@ struct __attribute__((packed)) PktConfig {
   uint8_t  magic[4];
   float    scanDegrees;                // sweep runs -this .. +this
   float    scanTime;                   // seconds for the full sweep
-  float    gearRatio;                  // motor revs per platform rev
   uint8_t  mode;                       // SCAN_MODE_*
   uint8_t  reserved;
   uint16_t steps;                      // stepped: intervals, so steps+1 stops
   uint16_t settleMs;                   // stepped: ring-down after each move
-  uint16_t averageMs;                  // stepped: IMU averaging window
   uint16_t captureMs;                  // stepped: lidar dwell at each stop
 };
 static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
@@ -93,17 +87,23 @@ static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
 // newline. A bare letter still works when typed into a serial monitor.
 #define CMD_START  's'  // park, settle, then sweep
 #define CMD_ABORT  'x'  // stop where you are, go idle
-#define CMD_HOME   'h'  // call the current platform angle zero
-#define CMD_ZERO   'z'  // re-bias the gyro and reset the AHRS (hold still)
+#define CMD_HOME   'h'  // call the current shaft angle zero
 #define CMD_STATUS '?'  // emit telemetry + config + a text event
-#define CMD_ANGLE  'a'  // "a25.0"  set the half-sweep in degrees
+#define CMD_ANGLE  'a'  // "a90.0"  set the half-sweep in degrees
 #define CMD_TIME   't'  // "t45.0"  set the sweep duration in seconds
 #define CMD_MODE   'm'  // "m1"     0 = continuous, 1 = stepped
 #define CMD_STEPS  'n'  // "n60"    stepped: intervals across the sweep
 #define CMD_DWELL  'd'  // "d400"   stepped: lidar capture time per stop, ms
+#define CMD_UNWRAP 'u'  // "u90"    turn the shaft this far, then re-home
 
 // Guard rails for the above, so a fat-fingered UI value cannot drive the
 // platform into its end stops or ask for a step rate the motor cannot hold.
+//
+// SCAN_DEGREES_MAX is 90 because the sweep is symmetric about home and the
+// lidar's own scan plane is vertical: half a turn of the shaft already carries
+// that plane through every azimuth, so 180 degrees of travel is a whole sphere
+// and anything past it only rescans what has been scanned and winds more twist
+// into the tether.
 #define SCAN_DEGREES_MIN 1.0f
 #define SCAN_DEGREES_MAX 90.0f
 #define SCAN_TIME_MIN    2.0f
@@ -112,3 +112,10 @@ static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
 #define SCAN_STEPS_MAX   2000
 #define SCAN_DWELL_MIN   50
 #define SCAN_DWELL_MAX   5000
+
+// The tether runs up the shaft, so it twists as the platform turns. Unwrap
+// turns the shaft a quarter turn and calls the result home, which shifts the
+// whole sweep range with it rather than leaving the next scan to wind the
+// tether straight back up.
+#define SCAN_UNWRAP_DEG    90.0f
+#define SCAN_UNWRAP_DEGMAX 180.0f

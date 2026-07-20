@@ -6,7 +6,8 @@ Three record types share the 55 AA 03 xx magic, where xx is the record length
 record is skipped a byte at a time, so boot chatter and dropouts cost at most
 one record.
 
-This module only decodes and reconstructs; tools/scan3d.py owns the rendering.
+This module only decodes and reconstructs; tools/scanner_ui.py owns the
+rendering.
 """
 
 import struct
@@ -15,128 +16,98 @@ import time
 
 import numpy as np
 
-import lidar_viz as lv  # RAW_ANGLE_MIN/MAX calibration lives there
-
 MAGIC = bytes((0x55, 0xAA, 0x03))
 
-SAMPLE_TAG, SAMPLE_LEN = 0x30, 48
-TELEM_TAG, TELEM_LEN = 0x38, 56
-CONFIG_TAG, CONFIG_LEN = 0x1A, 26
+SAMPLE_TAG, SAMPLE_LEN = 0x20, 32
+TELEM_TAG, TELEM_LEN = 0x10, 16
+CONFIG_TAG, CONFIG_LEN = 0x14, 20
 EVENT_TAG = 0x09
-# scanDegrees scanTime gearRatio | mode reserved steps settleMs averageMs
-# captureMs -- the stepped-mode fields are zero in a continuous scan.
-CONFIG_FMT = struct.Struct("<4x3f2B4H")
+# scanDegrees scanTime | mode reserved steps settleMs captureMs -- the
+# stepped-mode fields are zero in a continuous scan.
+CONFIG_FMT = struct.Struct("<4x2f2B3H")
 
 # Config field positions, same reasoning as the telemetry constants below.
-CFG_DEGREES, CFG_TIME, CFG_GEAR = 0, 1, 2
-CFG_MODE, CFG_STEPS = 3, 5
-CFG_SETTLE_MS, CFG_AVERAGE_MS, CFG_CAPTURE_MS = 6, 7, 8
+CFG_DEGREES, CFG_TIME = 0, 1
+CFG_MODE, CFG_STEPS = 2, 4
+CFG_SETTLE_MS, CFG_CAPTURE_MS = 5, 6
 
 MODE_CONTINUOUS, MODE_STEPPED = 0, 1
 
 # Telemetry field positions, so callers index by name instead of by a magic
 # number that silently shifts whenever the record grows.
 TEL_T_US = 0
-TEL_ACCEL = slice(1, 4)
-TEL_GYRO = slice(4, 7)
-TEL_QUAT = slice(7, 11)
-TEL_PLATFORM = 11
-TEL_STATE = 12
-TEL_DROPPED = 14
+TEL_PLATFORM = 1
+TEL_STATE = 2
+TEL_DROPPED = 4
 
-# The scan plane does not pass through the rotation axis: the lidar's beam
-# origin sits this far along the sensor's +Z (up) from it. That lever arm swings
-# as the platform tilts, so ignoring it smears every surface by up to
-# BEAM_OFFSET_MM * sin(scan angle) -- about 30 mm at +/-30 deg, which reads as
-# doubled walls. It is corrected by offsetting each point in the sensor frame
-# before the rotation is applied.
-BEAM_OFFSET_MM = 59.0
-
-# The stepper tilts the platform about the sensor's Y axis.
-TILT_AXIS = (0.0, 1.0, 0.0)
-
-# Rotation of the lidar about its own spin axis relative to the IMU's frame,
-# in degrees clockwise (the same sense the azimuth below runs in).
+# --- Mount geometry ---------------------------------------------------------
 #
-# The lidar and the IMU are two separate parts bolted to the same platform, and
-# nothing made their zero directions agree. The tilt axis above is the sensor's
-# Y, so if the lidar is mounted a quarter turn out, the axis the platform
-# actually tilts about lies along the lidar's X instead -- the cloud then hinges
-# about the wrong direction and the sweep smears sideways rather than stacking
-# into slices. The rig as built is 90 deg clockwise out, hence the default.
+# The lidar is bolted straight to the stepper shaft, and the shaft turns about
+# the world vertical. The lidar's own scan plane is mounted vertical -- it
+# contains the rotation axis -- which is what makes the scan three-dimensional:
+# each shaft angle contributes one vertical slice, and half a turn carries that
+# slice through every azimuth, so 180 degrees of travel is a whole sphere.
+#
+# At shaft angle 0 that slice is taken to be the world XZ plane, with the
+# lidar's spin axis along world Y. Everything below is stated in those terms.
+
+# How far the lidar's beam origin sits off the rotation axis, along its own spin
+# axis. Zero on this rig -- the sensor is centred on the shaft -- but kept as a
+# knob because a few millimetres of it shows up as doubled or thickened walls,
+# and it is the only mount error that is not a pure rotation.
+BEAM_OFFSET_MM = 0.0
+
+# The shaft turns about world Z: this is a plain yaw, and nothing else.
+SPIN_AXIS = (0.0, 0.0, 1.0)
+
+# Rotation of the lidar about its own spin axis, in degrees clockwise (the same
+# sense the azimuth below runs in).
+#
+# This is the one mount constant that genuinely has to be dialled in, because it
+# decides which direction within the vertical scan plane is *up*. Get it wrong
+# and the slice is tipped: the floor climbs into the walls and a room comes out
+# as a cone. Because it is a rotation about the lidar's own spin axis it is
+# exactly an offset on the azimuth, so it costs nothing to apply -- but it must
+# be applied before the shaft rotation, since afterwards the slice has already
+# been swung into the wrong place.
 #
 # It only ever needs to be a multiple of 90 unless the mount is genuinely
-# skewed, and the symptom of getting it wrong is unmistakable: a flat wall
-# comes out as a curved fan. Because it is a rotation about the lidar's own
-# spin axis, it is exactly an offset on the azimuth, and the beam standoff
-# (which lies along that axis) is unaffected.
-LIDAR_ROTATION_DEG = 90.0
+# skewed. Try 0 / 90 / 180 / -90 against a scene you know and keep the one where
+# the floor is flat.
+LIDAR_ROTATION_DEG = 0.0
 
 # Direction the lidar's reported angle runs, as seen from its +Z. The point
 # construction below places azimuth 0 at +Y and advances clockwise; set this
-# when the hardware actually advances the other way, which reflects the cloud.
+# when the hardware actually advances the other way.
+#
+# Unlike a rotation this is a reflection, so nothing else can undo it, and it is
+# not measurable from a capture: a mirrored scan of a room is exactly as
+# self-consistent as a correct one. Set it by eye against a scene whose
+# handedness you know -- text on a wall reading backwards is the giveaway.
 LIDAR_REVERSE = True
 
 # 180 deg about world X, applied to the finished cloud: (x, y, z) ->
-# (x, -y, -z). Scans otherwise come out upside down.
-FLIP_UPRIGHT = True
+# (x, -y, -z). Purely cosmetic -- it is a rigid transform, so it changes no
+# metric -- and only needed if the sensor is mounted inverted.
+FLIP_UPRIGHT = False
 
-# --- On the four knobs above, and what they can and cannot be derived from ---
-#
-# BEAM_OFFSET_MM, LIDAR_ROTATION_DEG, LIDAR_REVERSE and FLIP_UPRIGHT together
-# describe how the lidar is bolted on relative to the IMU. Three of them are
-# entangled in ways that are worth stating, because a lot of time can be lost
-# trying to solve for them from a capture:
-#
-#   * The azimuth zero and the beam offset SIGN are degenerate. Rotating the
-#     azimuth 180 deg and negating the offset differ only by a global inversion
-#     of the whole cloud, so they score identically on any self-consistency
-#     measure. Measured on a real capture, (+59, 105 deg) and (-59, 285 deg)
-#     came out bit-identical. This is why a lidar that physically sits +59 mm
-#     ABOVE the axis can appear to need -59: the sign is not independently
-#     meaningful until the azimuth zero is pinned down.
-#
-#   * LIDAR_REVERSE is unobservable in --from-stepper mode and only barely
-#     observable without it. At the default 90 deg rotation, reversing the
-#     azimuth is exactly a mirror about the XZ plane, and that mirror commutes
-#     with rotation about Y -- so against the stepper's pure-Y tilt the two
-#     reconstructions are identical point for point (verified: same cloud, same
-#     6816 occupied voxels).
-#
-#     Against the AHRS quaternion they are not quite identical, but only
-#     because the real rotation is not purely about Y: its axis carries about
-#     0.07 of X and Z, which is genuine mechanical slop. That residue makes the
-#     mirror very weakly measurable -- 6764 occupied voxels unreversed against
-#     6927 reversed, a 2.4% edge resting entirely on how the rig wobbles. That
-#     is not a basis for deciding a handedness convention. Set it by eye.
-#
-#   * FLIP_UPRIGHT is a rigid transform of the finished cloud, so it changes
-#     no metric either. Purely cosmetic, and safe to change on its own.
-#
-# What IS verifiable, and was: the AHRS tracks the sweep correctly. On a
-# +/-45 deg capture the quaternion's rotation axis came out [-0.02 +1.00 +0.05]
-# -- the sensor's Y, as designed -- at 0.994 deg per commanded degree. So when
-# a cloud looks wrong, these mount conventions are the place to look, not the
-# filter.
-#
-# The practical consequence: dial these in once by eye against a scene you know
-# (a room corner is ideal -- it fixes all three axes at once), and the UI will
-# remember them. The symptom-to-knob map is:
-#
-#   upside down, otherwise correct ............ FLIP_UPRIGHT
-#   handed wrong / text reads backwards ....... LIDAR_REVERSE
-#   hinges about the wrong axis, walls fan .... LIDAR_ROTATION_DEG
-#   walls doubled or thickened ................ BEAM_OFFSET_MM magnitude
+# --- Lidar angle calibration ------------------------------------------------
+# Raw angle -> degrees, solved from a 7555-frame capture. The field is 1/64
+# degree with a 0xA000 offset: angle = (raw - 40960) / 64, giving a full 0..360
+# turn over 40960..64000 (= 0xA000 + 360*64). The same 1/64 scale applies to the
+# speed field, which reads ~23053 = 360 RPM.
+RAW_ANGLE_MIN = 40960
+RAW_ANGLE_MAX = 64000
+SPEED_SCALE = 64.0
 
 POINTS = 8
 DIST_INVALID = 0x8000
 DIST_MASK = 0x7FFF
 
-# struct PktSample: magic[4] t_us qw qx qy qz platformDeg speed rawAngle dist[8]
-SAMPLE_FMT = struct.Struct("<4xI5f2H8H")
-# struct PktTelem: magic[4] t_us accel[3] gyro[3] quat[4] platformDeg
-#                  state reserved dropped
-TELEM_FMT = struct.Struct("<4xI11f2BH")
+# struct PktSample: magic[4] t_us platformDeg speed rawAngle dist[8]
+SAMPLE_FMT = struct.Struct("<4xIf2H8H")
+# struct PktTelem: magic[4] t_us platformDeg state reserved dropped
+TELEM_FMT = struct.Struct("<4xIf2BH")
 
 # The wire format defines a record's tag to BE its length, and each struct must
 # match that length. Growing PktTelem once already broke both halves of that
@@ -153,7 +124,7 @@ del _name, _tag, _len, _fmt
 # Scanner state machine (scanner.h). Only the two capturing states contribute
 # to the cloud; everything else is the platform in transit.
 STATE_IDLE, STATE_PARKING, STATE_SETTLING, STATE_SWEEPING, STATE_DONE = range(5)
-STATE_STEP_MOVE, STATE_STEP_SETTLE, STATE_STEP_AVERAGE, STATE_STEP_CAPTURE = \
+STATE_STEP_MOVE, STATE_STEP_SETTLE, STATE_STEP_CAPTURE, STATE_UNWRAP = \
     range(5, 9)
 STATE_NAMES = {
     STATE_IDLE: "idle",
@@ -163,32 +134,37 @@ STATE_NAMES = {
     STATE_DONE: "done",
     STATE_STEP_MOVE: "stepping",
     STATE_STEP_SETTLE: "settling (step)",
-    STATE_STEP_AVERAGE: "averaging IMU",
     STATE_STEP_CAPTURE: "capturing",
+    STATE_UNWRAP: "unwrapping",
 }
 
-# States whose lidar frames carry a pose worth trusting. In stepped mode the
-# firmware only stamps the averaged pose during STEP_CAPTURE; frames arriving
-# while it is moving or averaging carry a live quaternion for a platform that
-# is either mid-move or not being captured against, so they are not cloud data.
+# States whose lidar frames carry an angle worth trusting. In stepped mode the
+# frames arriving while the shaft is moving between stops are not cloud data.
 CAPTURE_STATES = (STATE_SWEEPING, STATE_STEP_CAPTURE)
+
+# States in which the platform is working its way across the sweep, for a
+# progress readout. Not the same list: the transit states belong here and not
+# above, because they say where the run has got to without contributing points.
+SWEEP_STATES = CAPTURE_STATES + (STATE_STEP_MOVE, STATE_STEP_SETTLE)
+
+
+def to_degrees(raw):
+    span = RAW_ANGLE_MAX - RAW_ANGLE_MIN
+    return np.mod((np.asarray(raw, dtype=np.float64) - RAW_ANGLE_MIN) * 360.0 / span,
+                  360.0)
 
 
 # Column layouts for _ColumnCache: name -> (slice or index, dtype or None).
 # A plain index yields a 1-D column, a slice a 2-D one.
 _SAMPLE_COLS = {
     "t_us": (0, None),
-    "quat": (slice(1, 5), None),          # w x y z
-    "platform": (5, None),
-    "speed": (6, None),
-    "raw_angle": (7, None),
-    "dist": (slice(8, 16), None),
+    "platform": (1, None),
+    "speed": (2, None),
+    "raw_angle": (3, None),
+    "dist": (slice(4, 12), None),
 }
 _TELEM_COLS = {
     "t_us": (TEL_T_US, None),
-    "accel": (TEL_ACCEL, None),
-    "gyro": (TEL_GYRO, None),
-    "quat": (TEL_QUAT, None),
     "platform": (TEL_PLATFORM, None),
     "state": (TEL_STATE, int),
     "dropped": (TEL_DROPPED, None),
@@ -240,7 +216,7 @@ class Capture:
         self.samples = []  # tuples straight out of SAMPLE_FMT
         self.telem = []
         self.events = []
-        # Latest (scanDegrees, scanTime, gearRatio) the device reported.
+        # Latest config tuple the device reported.
         self.config = None
         self._sample_cols = _ColumnCache(_SAMPLE_COLS)
         self._telem_cols = _ColumnCache(_TELEM_COLS)
@@ -288,11 +264,8 @@ class StreamParser:
         # Drop frames that arrive outside a capture state instead of storing
         # them. The firmware streams lidar frames unconditionally -- see
         # Scanner::update, which calls serviceLidar() in every state -- so a
-        # connected link appends samples forever, scan or no scan. Offline
-        # tools want them all (scan3d --all reconstructs the parked frames);
-        # a live viewer does not, because build_cloud's own _sweep_mask throws
-        # exactly these away again at the far end of every redraw. Without
-        # this the sample count never stops rising, which keeps the viewer
+        # connected link appends samples forever, scan or no scan. Without this
+        # the sample count never stops rising, which keeps the viewer
         # rebuilding a cloud that cannot change, over an input that only ever
         # grows.
         self.sweep_only = sweep_only
@@ -390,16 +363,6 @@ class StreamParser:
         return cap
 
 
-def parse(byte_source, capture=None, on_sample=None):
-    """Generator wrapper over StreamParser, for the command-line tools.
-
-    Yields the Capture after each chunk so callers can drive a live view.
-    """
-    p = StreamParser(capture, on_sample)
-    for chunk in byte_source:
-        yield p.feed(chunk)
-
-
 # --- sources ----------------------------------------------------------------
 
 
@@ -437,68 +400,7 @@ def open_port(port, baud=115200, timeout=0.05, dtr=True):
     return ser
 
 
-def serial_source(port, baud=115200, seconds=None, record=None, start=False):
-    fh = open(record, "wb") if record else None
-    deadline = time.time() + seconds if seconds else None
-    with open_port(port, baud) as ser:
-        if start:
-            time.sleep(0.2)
-            ser.reset_input_buffer()
-            ser.write(b"s")
-        try:
-            while deadline is None or time.time() < deadline:
-                b = ser.read(8192)
-                if b and fh:
-                    fh.write(b)
-                yield b
-        finally:
-            if fh:
-                fh.close()
-                print(f"recorded -> {record}", file=sys.stderr)
-
-
 # --- geometry ---------------------------------------------------------------
-
-
-def quat_to_matrix(q):
-    """(N,4) quaternions as w,x,y,z -> (N,3,3) rotation matrices."""
-    q = np.asarray(q, dtype=np.float64)
-    q = q / np.linalg.norm(q, axis=1, keepdims=True).clip(1e-12)
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    return np.stack([
-        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
-        np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
-        np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
-    ], axis=1)
-
-
-def resolve_frame(cap, col=None):
-    """Decide whether the AHRS quaternion maps sensor->world or world->sensor.
-
-    Madgwick implementations differ on this, and guessing wrong mirrors the
-    whole cloud in a way that is easy to mistake for a wiring error. The rig is
-    never in free fall, so the accelerometer always reads the up axis: rotating
-    it into the world frame must give (0,0,+1) no matter how far the platform
-    has tilted. Whichever of R and R^T holds that across the sweep is correct.
-    """
-    t = cap.telem_arrays()
-    if t is None or len(t["accel"]) < 5:
-        return False  # nothing to go on; assume the quaternion is sensor->world
-
-    if col is None:
-        col = cap.arrays()
-    a = t["accel"]
-    a = a / np.linalg.norm(a, axis=1, keepdims=True).clip(1e-9)
-    idx = np.searchsorted(col["t_us"], t["t_us"]).clip(0, len(cap) - 1)
-    R = quat_to_matrix(col["quat"][idx])
-
-    fwd = np.einsum("nij,nj->ni", R, a)[:, 2].mean()
-    inv = np.einsum("nji,nj->ni", R, a)[:, 2].mean()
-    transpose = inv > fwd
-    print(f"[frame] gravity along world +Z: R={fwd:+.3f} R^T={inv:+.3f} -> "
-          f"using {'R^T (world->sensor)' if transpose else 'R (sensor->world)'}",
-          file=sys.stderr)
-    return transpose
 
 
 def axis_angle_matrix(axis, deg):
@@ -512,74 +414,31 @@ def axis_angle_matrix(axis, deg):
             + (1 - c)[:, None, None] * (K @ K)[None])
 
 
-def estimate_tilt_offset(cap, col=None):
-    """Degrees the stepper's zero sits away from the IMU's, or None.
-
-    The stepper only knows the angle it was commanded to, measured from
-    wherever the platform happened to be when it was homed. The IMU measures
-    the real tilt against gravity. The difference is the mechanical zero
-    error, and it shows up in --from-stepper mode as the whole scene sitting
-    at a slight angle.
-
-    Only the tilt about Y is taken. For a rotation about Y, R[0,2] is sin of
-    the angle and R[2,2] is cos, so the pitch falls straight out. The median
-    rather than the mean, because the sweep ends carry the most mechanical
-    slop and a couple of degrees there should not drag the estimate.
-
-    Using the IMU here does not undo the point of --from-stepper. That mode
-    exists because the filter's YAW drifts over a long sweep; pitch is
-    accelerometer-corrected and does not drift, and this is a single constant
-    taken across the whole sweep rather than a per-sample pose.
-    """
-    if col is None:
-        try:
-            col = cap.arrays()
-        except SystemExit:
-            return None
-    m = _sweep_mask(cap, col)
-    if m.sum() < 10:
-        return None
-    R = quat_to_matrix(col["quat"][m])
-    imu_tilt = np.degrees(np.arctan2(R[:, 0, 2], R[:, 2, 2]))
-    return float(np.median(imu_tilt - col["platform"][m]))
-
-
 def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
-                transpose=None, from_stepper=False, tilt_axis=TILT_AXIS,
-                beam_offset=BEAM_OFFSET_MM, lidar_rotation=LIDAR_ROTATION_DEG,
-                lidar_reverse=LIDAR_REVERSE, flip_upright=FLIP_UPRIGHT,
-                tilt_offset=0.0):
+                beam_offset=BEAM_OFFSET_MM,
+                lidar_rotation=LIDAR_ROTATION_DEG,
+                lidar_reverse=LIDAR_REVERSE, flip_upright=FLIP_UPRIGHT):
     """Reconstruct the 3D point cloud.
 
-    Returns (xyz, dist, platform_deg). Each sample carries its own pose, so
-    there is no interpolation here: the 8 points of a frame are spread across
-    the azimuth gap to the next frame and rotated by that frame's quaternion.
+    Returns (xyz, dist, platform_deg). Each sample carries the shaft angle it
+    was taken at, so there is no interpolation and no pose estimation here: the
+    8 points of a frame are spread across the azimuth gap to the next frame,
+    lifted into the vertical scan plane, and yawed by that frame's shaft angle.
     """
     col = cap.arrays()
     n = len(cap)
     if n < 2:
         raise SystemExit(f"only {n} samples; capture a sweep first")
 
-    # The AHRS is the better source in principle -- it sees real mechanical
-    # slop and any flex in the 2:1 link. But Madgwick 6-DOF cannot observe yaw,
-    # so it drifts, and over a 30 s sweep that slowly rotates the whole cloud
-    # about Z and smears the room azimuthally. The stepper's own angle has no
-    # drift at all, only whatever error the gearing contributes, so it is worth
-    # reconstructing both ways and keeping the one that looks sharper.
-    if not from_stepper and transpose is None:
-        transpose = resolve_frame(cap, col)
-
     # Azimuth: a frame reports only its start angle, so its angular width is
     # the gap to the next frame. Frames whose successor was dropped would smear
     # their points over a bogus span, so they are discarded.
-    ang = lv.to_degrees(col["raw_angle"])
+    ang = to_degrees(col["raw_angle"])
     step = np.mod(np.diff(ang), 360.0)
     keep = (step > 0.0) & (step < 90.0)
 
-    state_ok = np.ones(n - 1, dtype=bool)
     if sweep_only:
-        state_ok = _sweep_mask(cap, col)[:-1]
-    keep &= state_ok
+        keep &= _sweep_mask(cap, col)[:-1]
     if not keep.any():
         raise SystemExit("no usable frames in the sweep - was 's' sent?")
 
@@ -594,32 +453,26 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
     if max_range is not None:
         good &= d <= max_range
 
-    # Bring the lidar's azimuth into the IMU's frame. A rotation about the spin
-    # axis is just an offset here, so it costs nothing and has to happen before
-    # the pose is applied -- afterwards the tilt has already been taken about
-    # the wrong direction and no amount of spinning fixes it. See
-    # LIDAR_ROTATION_DEG.
+    # Roll the lidar about its own spin axis into the mount's frame. That is
+    # exactly an offset on the azimuth, so it costs nothing -- and it has to
+    # happen here, before the shaft rotation, or the slice has already been
+    # swung into place tipped. See LIDAR_ROTATION_DEG.
     th = np.radians((-az if lidar_reverse else az) + lidar_rotation)
-    # Sensor frame: the lidar sweeps its own XY plane about +Z, and 0 deg is
-    # +Y turning clockwise -- the convention the 2D polar view already uses.
-    # Z is the beam's standoff from the rotation axis, not zero: the whole scan
-    # plane rides that far above the pivot and swings with it.
-    p = np.stack([d * np.sin(th), d * np.cos(th),
-                  np.full_like(d, beam_offset)], axis=-1)
 
-    if from_stepper:
-        # "auto" resolves against the IMU; a number is taken as given, and 0
-        # keeps the raw commanded angle. Only meaningful here -- the AHRS path
-        # measures the true tilt directly and has nothing to offset.
-        off = tilt_offset
-        if isinstance(off, str):
-            off = estimate_tilt_offset(cap, col) or 0.0
-        R = axis_angle_matrix(tilt_axis, col["platform"][k] + off)
-        sub = "nij,nkj->nki"
-    else:
-        R = quat_to_matrix(col["quat"][k])
-        sub = "nji,nkj->nki" if transpose else "nij,nkj->nki"
-    world = np.einsum(sub, R, p)
+    # The scan plane, at shaft angle 0. The lidar sweeps its own plane about its
+    # spin axis with 0 deg at "+cos" turning clockwise; that plane is mounted
+    # vertical, so the sin component runs out along world X and the cos
+    # component runs up world Z. The spin axis is then world Y, and the beam's
+    # standoff from the rotation axis lies along it.
+    p = np.stack([d * np.sin(th),
+                  np.full_like(d, beam_offset),
+                  d * np.cos(th)], axis=-1)
+
+    # Yaw about world Z by the shaft angle. No transpose ambiguity, no drift,
+    # no offset to solve for: this is the commanded angle of a sensor rigidly
+    # bolted to the shaft that produced it.
+    R = axis_angle_matrix(SPIN_AXIS, col["platform"][k])
+    world = np.einsum("nij,nkj->nki", R, p)
 
     # 180 deg about world X, after the pose. See FLIP_UPRIGHT.
     if flip_upright:

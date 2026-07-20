@@ -2,35 +2,38 @@
 
 #include <Arduino.h>
 
-#include "ahrs.h"
 #include "lidar_parser.h"
 #include "protocol.h"   // SCAN_MODE_*, the command letters and their limits
 #include "stepper.h"
 
-// The Scanner runs entirely on core0: the motor, the lidar link and the USB
-// protocol. The IMU and the Madgwick filter live on core1 -- see ahrs.h for
-// why, and for the core-ownership rules that keep the split lock-free. This
-// class only ever reads snapshots out of ahrs::, it never touches I2C.
+// The Scanner is the whole application: the motor, the lidar link and the USB
+// protocol, all on core0. There is no second core and no sensor fusion -- the
+// lidar sits directly on the stepper shaft, so the step count is the pose.
 
 // --- Scan geometry ----------------------------------------------------------
-// The platform tilts +/-SCAN_DEGREES about the stepper's axis (which is the
-// sensor's Y) while the lidar keeps sweeping its own plane, so the two
-// rotations together cover a band of the sphere. A sweep runs -SCAN_DEGREES ->
-// +SCAN_DEGREES. Both of these are only the power-on defaults now; the host
-// can override them at runtime with the 'a' and 't' commands.
-#define SCAN_DEGREES 30.0f
+// The lidar is bolted to the shaft with its scan plane vertical, and the shaft
+// turns about the world vertical axis. Half a turn therefore sweeps that
+// vertical plane through every azimuth and covers the whole sphere, which is
+// why the default half-sweep is the full 90 the limits allow: -90 -> +90.
+//
+// Both of these are only the power-on defaults; the host can override them at
+// runtime with the 'a' and 't' commands.
+#define SCAN_DEGREES 90.0f
 #define SCAN_TIME    30.0f   // seconds for the full 2*SCAN_DEGREES sweep
 
-// 2 motor revolutions per platform revolution.
-#define SCAN_GEAR_RATIO 2.0f
+// The shaft carries the lidar directly -- no gearing, no linkage, no backlash.
+// One motor revolution is one platform revolution, so the position maths below
+// is the motor's own and there is no ratio to apply.
 
-// Finer microstepping buys smoothness, which matters more than torque here:
-// the sweep is slow and the load is a few hundred grams of sensor.
+// The full 1/16. With the lidar sitting straight on the shaft there is almost
+// nothing to turn, so the torque that coarser stepping buys is wasted; what
+// finer stepping buys instead is smoothness, and that is the whole game here.
+// At 200 full steps/rev this is 3200 microsteps per turn, or 0.1125 deg each.
 #define SCAN_MICROSTEP MICROSTEP_SIXTEENTH
 
 // Getting to the start of the sweep is dead time, so it runs fast and ramped.
-#define SCAN_TRAVEL_SPEED 800.0f    // microsteps/s
-#define SCAN_TRAVEL_ACCEL 1600.0f   // microsteps/s^2
+#define SCAN_TRAVEL_SPEED 1600.0f   // microsteps/s, = 180 deg/s
+#define SCAN_TRAVEL_ACCEL 3200.0f   // microsteps/s^2
 
 // Parking overshoots slightly and the sensor rings; let it die out before the
 // data that has to be accurate starts flowing.
@@ -39,32 +42,27 @@
 // --- Idle power -------------------------------------------------------------
 // Holding torque costs the full coil current and dumps it into the A4988 and
 // the motor as heat, for as long as the rig sits there doing nothing -- which
-// between scans is most of its life. It also bakes that heat into the IMU
-// sitting centimetres away, and a drifting bias is the one error a 30 s sweep
-// cannot absorb. So the coils are released once the platform has been parked
-// and still for this long.
+// between scans is most of its life. So the coils are released once the
+// platform has been parked and still for this long.
 //
 // The cost is real and worth stating plainly: with the coils cold the shaft is
-// backdrivable, so a platform that is not balanced about its axis will sag,
-// and currentPosition() then means nothing. If yours does sag, either balance
-// it or set this to 0 to keep the old always-energised behaviour. The grace
-// period also keeps a back-to-back 's' from chattering the driver, and lets
-// the parking wobble die before the brake comes off.
+// backdrivable, so a platform that is not balanced about its axis will sag, and
+// currentPosition() then means nothing. If yours does sag, either balance it or
+// set this to 0 to keep the always-energised behaviour. The grace period also
+// keeps a back-to-back 's' from chattering the driver, and lets the parking
+// wobble die before the brake comes off.
 #define SCAN_IDLE_DISABLE_MS 750
 
 // --- Stepped mode -----------------------------------------------------------
-// A continuous sweep asks the AHRS to track a moving platform while the lidar
-// buzzes it, and the pose stamped on a frame is only as good as the filter's
-// instantaneous output. Stepped mode removes both problems by never capturing
-// while moving: it stops at each stop, waits out the ring-down, averages the
-// IMU over a window with the platform genuinely stationary, then freezes that
-// pose and stamps it on every frame captured before the next move.
+// A continuous sweep stamps each frame with the angle the shaft was passing
+// through as it arrived, which is exact but smears anything the lidar's own
+// buzz adds. Stepped mode removes that: it stops at each stop, waits out the
+// ring-down, then captures with the shaft genuinely stationary.
 //
-// It is much slower -- these three windows are paid at every one of steps+1
-// stops -- which is the trade. Use it when a continuous scan comes out smeared.
+// It is much slower -- both windows are paid at every one of steps+1 stops --
+// which is the trade. Use it when a continuous scan comes out smeared.
 #define SCAN_STEPS_DEFAULT   60
-#define SCAN_STEP_SETTLE_MS  250   // ring-down after a move, before averaging
-#define SCAN_STEP_AVERAGE_MS 200   // IMU averaging window, ~20 ticks at 100 Hz
+#define SCAN_STEP_SETTLE_MS  250   // ring-down after a move, before capturing
 #define SCAN_STEP_CAPTURE_MS 400   // lidar dwell, ~2 revs of a 300 RPM lidar
 
 // Travel between adjacent stops is a fraction of a degree, so the ramp never
@@ -79,12 +77,10 @@ enum ScanState : uint8_t {
   SCAN_SETTLING,   // parked, waiting for the wobble to stop
   SCAN_SWEEPING,   // the run that produces the cloud
   SCAN_DONE,
-  // Stepped mode. Appended rather than inserted: the host decodes this as a
-  // plain integer and inserting would silently relabel every existing capture.
   SCAN_STEP_MOVE,     // travelling to the next stop
   SCAN_STEP_SETTLE,   // stopped, waiting for the ring-down
-  SCAN_STEP_AVERAGE,  // stopped and quiet, averaging the IMU
-  SCAN_STEP_CAPTURE,  // stopped, streaming lidar against the frozen pose
+  SCAN_STEP_CAPTURE,  // stopped, streaming lidar at a fixed angle
+  SCAN_UNWRAP,        // turning the shaft to unwind the tether
 };
 
 // Owns the motor and the USB link. main() just pumps it.
@@ -101,23 +97,18 @@ class Scanner {
   void handleCommands();
   void runCommand(char cmd, const char *arg, bool hasArg);
   void emitConfig();
-  void serviceAhrs();
   void serviceLidar();
   void serviceTelemetry();
   void serviceIdlePower();
   void advanceStateMachine();
 
   void startScan();
+  void startUnwrap(float deg);
   void abort(const char *why);
-  void emitImuStatus();
   void emitEvent(const char *fmt, ...);
 
-  // --- Stepped mode ---------------------------------------------------------
-  void beginAverage();          // enter SCAN_STEP_AVERAGE with a clean sum
-  void accumulateAverage();     // fold in each new AHRS tick; called from update()
-  void finishAverage();         // normalise the sum into poseQ_
-  void advanceStep();           // move to the next stop, or finish the scan
-  float stepAngle(uint16_t i) const;   // platform degrees at stop `i`
+  void advanceStep();                  // move to the next stop, or finish
+  float stepAngle(uint16_t i) const;   // shaft degrees at stop `i`
 
   // Energises the coils if they were released, and warns once when the
   // released interval means the angle can no longer be trusted.
@@ -130,18 +121,6 @@ class Scanner {
   ScanState state_    = SCAN_IDLE;
   uint32_t stateAt_   = 0;   // millis() when the current state was entered
   uint32_t nextTelem_ = 0;   // millis()
-
-  // The last snapshot pulled off core1, refreshed once per loop and stamped
-  // onto every sample and telemetry record.
-  AhrsSample ahrs_ = {0, 1.0f, 0.0f, 0.0f, 0.0f,
-                      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-
-  // Edges of core1's status that core0 has already announced. Core1 cannot
-  // write to Serial, so this is how its news reaches the host.
-  bool     imuReported_  = false;
-  bool     calibSeen_    = false;
-  uint32_t calibCount_   = 0;
-  uint16_t lateSeen_     = 0;
 
   uint16_t dropped_ = 0;     // samples binned because the host stopped reading
 
@@ -158,17 +137,6 @@ class Scanner {
   uint16_t steps_     = SCAN_STEPS_DEFAULT;
   uint16_t dwellMs_   = SCAN_STEP_CAPTURE_MS;
   uint16_t stepIndex_ = 0;      // which stop we are at, 0..steps_
-
-  // The averaged pose for the current stop, stamped on every frame captured
-  // there. Seeded to identity so a stop that saw no IMU ticks at all emits a
-  // valid rotation rather than a zero quaternion the host cannot normalise.
-  float poseQw_ = 1.0f, poseQx_ = 0.0f, poseQy_ = 0.0f, poseQz_ = 0.0f;
-
-  // Running sum for the averaging window. Doubles because a 200 ms window is
-  // only ~20 terms but the components are near-unity and near-cancelling.
-  double  sumQw_ = 0.0, sumQx_ = 0.0, sumQy_ = 0.0, sumQz_ = 0.0;
-  uint16_t avgCount_ = 0;
-  uint32_t avgLastT_ = 0;       // t_us of the last tick folded in, to skip repeats
 
   char    line_[24];         // one command line being assembled
   uint8_t lineLen_ = 0;

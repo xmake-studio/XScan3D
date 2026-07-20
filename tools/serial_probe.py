@@ -108,14 +108,9 @@ def probe(port, baud, dtr, seconds, send):
 
         if cap.telem:
             t = cap.telem[-1]
-            q = t[sp.TEL_QUAT]
             print(f"  latest: state={sp.STATE_NAMES.get(int(t[sp.TEL_STATE]),'?')} "
                   f"platform={t[sp.TEL_PLATFORM]:+.2f} deg "
                   f"dropped={int(t[sp.TEL_DROPPED])}")
-            print(f"  accel: {np.array(t[sp.TEL_ACCEL]).round(3)} g   "
-                  f"quat: {np.array(q).round(3)}")
-            if abs(np.linalg.norm(q) - 1.0) > 0.1:
-                print("  AHRS quaternion is not unit length - filter not running")
         if not cap.samples:
             print("\n  No lidar samples -- telemetry works but the lidar UART")
             print("  is quiet. Check the lidar's power and its TX -> GPIO13.")

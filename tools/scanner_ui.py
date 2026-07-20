@@ -4,8 +4,8 @@
     python scanner_ui.py
 
 Connect to the device, set the sweep, run it, watch the cloud build, then save
-or reload it as .ply. Everything the command-line tools do is here, and they
-share the same reconstruction code (scan_proto) so results are identical.
+or reload it as .ply. This is the whole host side; the only other tool is
+serial_probe.py, for the case where this one cannot get the port to talk at all.
 
 The View panel's Mode dropdown switches between the raw point cloud and a
 reconstructed triangle surface; the settings below it follow the mode.
@@ -27,7 +27,7 @@ import pyqtgraph.opengl as gl
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 import scan_proto as sp
-import scan3d
+import cloud_io
 import meshing
 
 BAUD = 115200
@@ -168,7 +168,7 @@ class SerialLink(QtCore.QThread):
         # idle-but-connected link would otherwise pile up samples forever and
         # keep the viewer rebuilding a finished cloud. The raw .bin recording
         # above is written before the parser sees the bytes, so it still gets
-        # every frame and `scan3d --all` can still reconstruct them.
+        # every frame regardless.
         parser = sp.StreamParser(self.cap, echo_events=False, sweep_only=True)
         n_ev = n_tel = 0
         n_cfg = None
@@ -398,11 +398,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         self._mesh_worker = None
         self._mesh_points = 0      # cloud size the mesh was built from
         self.state = sp.STATE_IDLE
-        # Cached quaternion convention, resolved once per capture. The overlay
-        # has to apply the same one the cloud did or it contradicts the points.
-        self._transpose = None
-        self.platform = 0.0        # last commanded tilt the device reported
-        self._last_quat = None     # so the triad can be redrawn off-tick
+        self.platform = 0.0        # last shaft angle the device reported
         self.sweep_started = None
         self.connected_at = 0.0
         self.warned_silent = False
@@ -496,22 +492,6 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.mesh_item.setVisible(False)
         self.view.addItem(self.mesh_item)
 
-        # Live IMU attitude: a triad of the sensor's own axes drawn in world
-        # space. X red, Y green, Z blue. Z is the lidar's spin axis, so the
-        # blue arm is the one that tips as the platform sweeps.
-        self.axis_items = []
-        for colour in ((1, 0.2, 0.2, 1), (0.2, 1, 0.2, 1), (0.3, 0.5, 1, 1)):
-            it = gl.GLLinePlotItem(pos=np.zeros((2, 3)), color=colour,
-                                   width=3.0, antialias=True)
-            self.view.addItem(it)
-            self.axis_items.append(it)
-        # The scan plane the lidar actually sweeps, as a ring at the beam's
-        # standoff, so the 59 mm offset is visible rather than notional.
-        self.plane_item = gl.GLLinePlotItem(pos=np.zeros((0, 3)),
-                                            color=(1, 1, 1, 0.35), width=1.0,
-                                            antialias=True)
-        self.view.addItem(self.plane_item)
-
         root.addWidget(self.view, 1)
 
         self.statusBar().showMessage("disconnected")
@@ -560,9 +540,13 @@ class ScannerUI(QtWidgets.QMainWindow):
 
         self.angle_spin = QtWidgets.QDoubleSpinBox()
         self.angle_spin.setRange(1.0, 90.0)
-        self.angle_spin.setValue(30.0)
+        self.angle_spin.setValue(90.0)
         self.angle_spin.setSuffix(" deg")
-        self.angle_spin.setToolTip("Half-sweep: the platform runs -this to +this")
+        self.angle_spin.setToolTip(
+            "Half-sweep: the shaft runs -this to +this about the vertical.\n"
+            "90 is the whole scene. The lidar's scan plane is vertical, so half "
+            "a turn of the shaft already carries it through every azimuth -- "
+            "there is nothing past 90 that has not been scanned already.")
         f.addWidget(QtWidgets.QLabel("Angle  ±"), 0, 0)
         f.addWidget(self.angle_spin, 0, 1)
 
@@ -578,8 +562,8 @@ class ScannerUI(QtWidgets.QMainWindow):
         # updates to say what it will actually take.
         self.stepped_chk = QtWidgets.QCheckBox("Stepped (stop at each angle)")
         self.stepped_chk.setToolTip(
-            "Moves, stops, waits out the ring-down, averages the IMU with the "
-            "platform genuinely still, then captures against that one pose.\n"
+            "Moves, stops, waits out the ring-down, then captures with the "
+            "shaft genuinely still.\n"
             "Much slower than a continuous sweep, and much less sensitive to "
             "the lidar's vibration.")
         self.stepped_chk.stateChanged.connect(self._on_mode_changed)
@@ -621,36 +605,49 @@ class ScannerUI(QtWidgets.QMainWindow):
         f.addWidget(self.stop_btn, 6, 1)
 
         self.home_btn = QtWidgets.QPushButton("Set home")
-        self.home_btn.setToolTip("Call the current platform angle zero")
+        self.home_btn.setToolTip("Call the current shaft angle zero")
         self.home_btn.clicked.connect(lambda: self._send("h"))
-        f.addWidget(self.home_btn, 7, 0)
-        self.cal_btn = QtWidgets.QPushButton("Calibrate IMU")
-        self.cal_btn.setToolTip("Re-bias the gyro. Keep the rig still.")
-        self.cal_btn.clicked.connect(self._calibrate)
-        f.addWidget(self.cal_btn, 7, 1)
+        f.addWidget(self.home_btn, 7, 0, 1, 2)
+
+        # The lidar's tether runs up the shaft and twists with it. These take a
+        # quarter turn out of that twist and call where the shaft landed home,
+        # which is the part that matters: the sweep is symmetric about home, so
+        # without re-homing the next scan would drive straight back through the
+        # turn just taken out and wind the tether right back up.
+        unwrap_lbl = QtWidgets.QLabel("Unwrap cable")
+        unwrap_lbl.setToolTip(
+            "Turns the shaft 90 deg to unwind the lidar's tether, then treats "
+            "that position as the new home.\n"
+            "Watch which way the cable is wound and press the matching "
+            "direction. The scene rotates with home, so scans taken either "
+            "side of an unwrap are 90 deg apart.")
+        f.addWidget(unwrap_lbl, 8, 0, 1, 2)
+
+        self.unwrap_ccw_btn = QtWidgets.QPushButton("↺  −90°")
+        self.unwrap_ccw_btn.setToolTip("Turn the shaft 90 deg anticlockwise, "
+                                       "then re-home")
+        self.unwrap_ccw_btn.clicked.connect(lambda: self._unwrap(-90.0))
+        f.addWidget(self.unwrap_ccw_btn, 9, 0)
+
+        self.unwrap_cw_btn = QtWidgets.QPushButton("↻  +90°")
+        self.unwrap_cw_btn.setToolTip("Turn the shaft 90 deg clockwise, "
+                                      "then re-home")
+        self.unwrap_cw_btn.clicked.connect(lambda: self._unwrap(90.0))
+        f.addWidget(self.unwrap_cw_btn, 9, 1)
 
         self.clear_btn = QtWidgets.QPushButton("Clear scene")
         self.clear_btn.setToolTip(
             "Drop the points collected so far and start the cloud over. The "
             "raw .bin recording is untouched, so nothing is actually lost.")
         self.clear_btn.clicked.connect(self._clear_scene)
-        f.addWidget(self.clear_btn, 8, 0, 1, 2)
+        f.addWidget(self.clear_btn, 10, 0, 1, 2)
 
         self.progress = QtWidgets.QProgressBar()
         self.progress.setTextVisible(True)
-        f.addWidget(self.progress, 9, 0, 1, 2)
+        f.addWidget(self.progress, 11, 0, 1, 2)
 
         self.state_lbl = QtWidgets.QLabel("idle")
-        f.addWidget(self.state_lbl, 10, 0, 1, 2)
-
-        self.orient_chk = QtWidgets.QCheckBox("Show live IMU orientation")
-        self.orient_chk.setChecked(True)
-        self.orient_chk.stateChanged.connect(self._apply_orient_visibility)
-        f.addWidget(self.orient_chk, 11, 0, 1, 2)
-
-        self.orient_lbl = QtWidgets.QLabel("attitude: --")
-        self.orient_lbl.setStyleSheet("font-family: monospace;")
-        f.addWidget(self.orient_lbl, 12, 0, 1, 2)
+        f.addWidget(self.state_lbl, 12, 0, 1, 2)
 
         self._on_mode_changed()
         return g
@@ -713,10 +710,13 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.offset_spin.setValue(sp.BEAM_OFFSET_MM)
         self.offset_spin.setSuffix(" mm")
         self.offset_spin.setToolTip(
-            "Distance from the rotation axis up to the lidar's scan plane. "
-            "Wrong values show up as doubled or thickened walls.")
+            "How far the lidar's beam origin sits off the rotation axis, along "
+            "its own spin axis.\n"
+            "Zero on this rig -- the sensor is centred on the shaft -- but a "
+            "few millimetres of it shows up as doubled or thickened walls, and "
+            "it is the only mount error that is not a pure rotation.")
         self.offset_spin.valueChanged.connect(self._rebuild)
-        f.addWidget(QtWidgets.QLabel("Beam offset"), 5, 0)
+        f.addWidget(QtWidgets.QLabel("Axis offset"), 5, 0)
         f.addWidget(self.offset_spin, 5, 1)
 
         self.lidar_rot_spin = QtWidgets.QDoubleSpinBox()
@@ -725,14 +725,13 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.lidar_rot_spin.setSingleStep(90.0)
         self.lidar_rot_spin.setSuffix(" deg CW")
         self.lidar_rot_spin.setToolTip(
-            "How far the lidar is mounted round from the IMU's frame, "
-            "clockwise.\n"
-            "The platform tilts about the sensor's Y axis, so if this is "
-            "wrong the cloud hinges about the wrong direction: a flat wall "
-            "comes out as a curved fan. Try 0 / 90 / 180 / -90 and keep the "
-            "one where straight things look straight.")
+            "How far the lidar is rolled about its own spin axis, clockwise.\n"
+            "This is the knob that decides which direction within the vertical "
+            "scan plane is up. Get it wrong and the slice is tipped: the floor "
+            "climbs into the walls and a room comes out as a cone. Try "
+            "0 / 90 / 180 / -90 and keep the one where the floor is flat.")
         self.lidar_rot_spin.valueChanged.connect(self._rebuild)
-        f.addWidget(QtWidgets.QLabel("Lidar rotation"), 6, 0)
+        f.addWidget(QtWidgets.QLabel("Lidar roll"), 6, 0)
         f.addWidget(self.lidar_rot_spin, 6, 1)
 
         self.reverse_chk = QtWidgets.QCheckBox("Reverse azimuth direction")
@@ -740,63 +739,26 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.reverse_chk.setToolTip(
             "Which way the lidar's reported angle runs. Getting this wrong "
             "reflects the cloud, and no rotation can undo a reflection.\n"
-            "This one cannot be worked out from a capture: the platform tilts "
-            "only about Y, and the mirror commutes with that exactly, so a "
-            "mirrored scan is just as self-consistent as a correct one. Set it "
-            "by eye against a scene you know.")
+            "It cannot be worked out from a capture either: a mirrored scan of "
+            "a room is exactly as self-consistent as a correct one. Set it by "
+            "eye against a scene whose handedness you know -- text on a wall "
+            "reading backwards is the giveaway.")
         self.reverse_chk.stateChanged.connect(self._rebuild)
         f.addWidget(self.reverse_chk, 7, 0, 1, 2)
 
         self.flip_chk = QtWidgets.QCheckBox("Flip upright (180 deg)")
         self.flip_chk.setChecked(sp.FLIP_UPRIGHT)
         self.flip_chk.setToolTip(
-            "Turns the finished cloud 180 deg about world X, because scans "
-            "otherwise come out upside down.\n"
-            "The stream itself is self-consistent, so this corrects the "
-            "mounting rather than a decoding error -- see FLIP_UPRIGHT in "
-            "scan_proto.py.")
+            "Turns the finished cloud 180 deg about world X, for a sensor "
+            "mounted inverted.\n"
+            "A rigid transform, so it changes no measurement -- purely "
+            "cosmetic, and safe to toggle on its own.")
         self.flip_chk.stateChanged.connect(self._rebuild)
         f.addWidget(self.flip_chk, 8, 0, 1, 2)
 
-        self.stepper_chk = QtWidgets.QCheckBox("Tilt from stepper, not IMU")
-        self.stepper_chk.setToolTip(
-            "The IMU sees real mechanical slop but its yaw drifts over a long "
-            "sweep. The step count has no drift. Try both and keep the sharper.")
-        self.stepper_chk.stateChanged.connect(self._on_tilt_source_changed)
-        f.addWidget(self.stepper_chk, 9, 0, 1, 2)
-
-        # The stepper's zero is wherever the platform was when it was homed,
-        # which is not level. Uncorrected it tips the whole scene.
-        self.tilt_off_spin = QtWidgets.QDoubleSpinBox()
-        self.tilt_off_spin.setRange(-90.0, 90.0)
-        self.tilt_off_spin.setDecimals(2)
-        self.tilt_off_spin.setSingleStep(0.25)
-        self.tilt_off_spin.setSuffix(" deg")
-        self.tilt_off_spin.setToolTip(
-            "Added to every commanded platform angle, to correct a home "
-            "position that was not level.")
-        self.tilt_off_spin.valueChanged.connect(self._rebuild)
-        self.tilt_off_lbl = QtWidgets.QLabel("Stepper zero")
-        f.addWidget(self.tilt_off_lbl, 10, 0)
-        f.addWidget(self.tilt_off_spin, 10, 1)
-
-        self.tilt_auto_chk = QtWidgets.QCheckBox("Auto from IMU")
-        self.tilt_auto_chk.setChecked(True)
-        self.tilt_auto_chk.setToolTip(
-            "Measure the offset against gravity instead of typing it: the "
-            "median difference between the IMU's tilt and the commanded "
-            "angle, over the whole sweep.\n"
-            "This does not reintroduce the drift you switched modes to "
-            "avoid -- it is the filter's YAW that drifts, while pitch stays "
-            "accelerometer-corrected, and this is one constant for the whole "
-            "scan rather than a per-sample pose.")
-        self.tilt_auto_chk.stateChanged.connect(self._on_tilt_source_changed)
-        f.addWidget(self.tilt_auto_chk, 11, 0, 1, 2)
-
         b = QtWidgets.QPushButton("Reset camera")
         b.clicked.connect(self._frame_cloud)
-        f.addWidget(b, 12, 0, 1, 2)
-        self._on_tilt_source_changed()
+        f.addWidget(b, 9, 0, 1, 2)
         return g
 
     def _geometry_group(self):
@@ -995,7 +957,6 @@ class ScannerUI(QtWidgets.QMainWindow):
             "scan/stepped": self.stepped_chk,
             "scan/steps": self.steps_spin,
             "scan/dwell": self.dwell_spin,
-            "scan/show_orientation": self.orient_chk,
             "view/mode": self.mode_box,
             "view/color_by": self.color_box,
             "view/point_size": self.size_spin,
@@ -1013,9 +974,6 @@ class ScannerUI(QtWidgets.QMainWindow):
             "geom/lidar_rotation": self.lidar_rot_spin,
             "geom/lidar_reverse": self.reverse_chk,
             "geom/flip_upright": self.flip_chk,
-            "geom/from_stepper": self.stepper_chk,
-            "geom/tilt_offset": self.tilt_off_spin,
-            "geom/tilt_offset_auto": self.tilt_auto_chk,
         }
         self._restore_settings()
 
@@ -1053,7 +1011,6 @@ class ScannerUI(QtWidgets.QMainWindow):
             finally:
                 w.blockSignals(False)
         self._on_mode_changed()
-        self._on_tilt_source_changed()
         self._on_algo_changed()
         # Last, and unconditionally: it decides which half of the panel is
         # visible, so it has to run even when nothing was restored.
@@ -1157,9 +1114,9 @@ class ScannerUI(QtWidgets.QMainWindow):
             self.est_lbl.setText("")
             return
         stops = self.steps_spin.value() + 1
-        # Mirrors SCAN_STEP_SETTLE_MS + SCAN_STEP_AVERAGE_MS in scanner.h; the
-        # travel between stops is on top and depends on the step size.
-        secs = stops * (250 + 200 + self.dwell_spin.value()) / 1000.0
+        # Mirrors SCAN_STEP_SETTLE_MS in scanner.h; the travel between stops is
+        # on top and depends on the step size.
+        secs = stops * (250 + self.dwell_spin.value()) / 1000.0
         arc = 2 * self.angle_spin.value() / self.steps_spin.value()
         self.est_lbl.setText(
             f"{stops} stops of {arc:.2f} deg, at least {secs / 60:.1f} min")
@@ -1180,21 +1137,17 @@ class ScannerUI(QtWidgets.QMainWindow):
             self._send(f"d{self.dwell_spin.value()}")
         return True
 
-    def _on_tilt_source_changed(self):
-        """The offset only means anything when the tilt comes from the stepper."""
-        stepper = self.stepper_chk.isChecked()
-        auto = self.tilt_auto_chk.isChecked()
-        for w in (self.tilt_off_lbl, self.tilt_auto_chk):
-            w.setEnabled(stepper)
-        # In auto mode the box becomes a readout of the measured value, so it
-        # stays visible -- seeing "+4.66" is how you know the estimate is sane.
-        self.tilt_off_spin.setEnabled(stepper and not auto)
-        self.tilt_off_spin.setReadOnly(auto)
-        # The switch changes which pose the overlay draws, so repaint it now
-        # rather than leaving the old source on screen until the next telemetry
-        # record lands.
-        self._rebuild()
-        self._update_orientation(self._last_quat)
+    def _unwrap(self, deg):
+        """Turn the shaft to unwind the tether, and re-home where it lands.
+
+        Re-homing is done by the firmware, not here, and it is the point of the
+        command: the sweep is symmetric about home, so a turn that did not move
+        home with it would be undone by the very next scan.
+        """
+        if self.state not in (sp.STATE_IDLE, sp.STATE_DONE):
+            self._log("cannot unwrap mid-sweep")
+            return
+        self._send(f"u{deg:.1f}")
 
     def _clear_scene(self):
         """Throw away the points collected so far and start the cloud over.
@@ -1208,7 +1161,6 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.cloud = None
         self.loaded_rgb = None
         self._built_n = 0
-        self._transpose = None
         self.mesh = None
         self._mesh_points = 0
         self.mesh_item.setVisible(False)
@@ -1233,12 +1185,6 @@ class ScannerUI(QtWidgets.QMainWindow):
     def _stop(self):
         self._send("x")
 
-    def _calibrate(self):
-        if self.state not in (sp.STATE_IDLE, sp.STATE_DONE):
-            self._log("cannot calibrate mid-sweep")
-            return
-        self._send("z")
-
     # --- signals ------------------------------------------------------------
 
     def _log(self, text):
@@ -1252,7 +1198,6 @@ class ScannerUI(QtWidgets.QMainWindow):
     def _on_config(self, cfg):
         deg = cfg[sp.CFG_DEGREES]
         secs = cfg[sp.CFG_TIME]
-        gear = cfg[sp.CFG_GEAR]
         stepped = int(cfg[sp.CFG_MODE]) == sp.MODE_STEPPED
         # Adopt the device's values without echoing them straight back.
         for w, val in ((self.angle_spin, deg), (self.time_spin, secs),
@@ -1266,82 +1211,11 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.stepped_chk.blockSignals(False)
         self._on_mode_changed()
 
-        self._log(f"device config: ±{deg:.1f} deg, gear {gear:.1f}:1, "
+        self._log(f"device config: ±{deg:.1f} deg, "
                   + (f"stepped, {int(cfg[sp.CFG_STEPS]) + 1} stops, "
                      f"{int(cfg[sp.CFG_SETTLE_MS])}/"
-                     f"{int(cfg[sp.CFG_AVERAGE_MS])}/"
-                     f"{int(cfg[sp.CFG_CAPTURE_MS])} ms settle/avg/capture"
+                     f"{int(cfg[sp.CFG_CAPTURE_MS])} ms settle/capture"
                      if stepped else f"continuous over {secs:.1f} s"))
-
-    # Length of the drawn sensor axes, mm. Long enough to read against a
-    # room-sized cloud without hiding it.
-    AXIS_LEN = 700.0
-
-    def _apply_orient_visibility(self):
-        on = self.orient_chk.isChecked()
-        for it in self.axis_items:
-            it.setVisible(on)
-        self.plane_item.setVisible(on)
-
-    def _pose_matrix(self, quat):
-        """The rotation the *cloud* is currently being built with, or None.
-
-        This deliberately mirrors build_cloud rather than always reading the
-        AHRS: in "tilt from stepper" mode the points are placed by the
-        commanded stepper angle and the quaternion is not consulted at all, so
-        a triad drawn from the quaternion showed an attitude the cloud did not
-        share -- the IMU's drifting yaw against points that have none, plus the
-        whole tilt-offset correction missing. Same geometry in, same axes out.
-        """
-        if self.stepper_chk.isChecked():
-            deg = self.platform + self.tilt_off_spin.value()
-            return sp.axis_angle_matrix(sp.TILT_AXIS, np.array([deg]))[0]
-
-        if quat is None:
-            return None
-        q = np.asarray(quat, dtype=np.float64)
-        if not np.isfinite(q).all() or np.linalg.norm(q) < 1e-6:
-            return None
-        R = sp.quat_to_matrix(q[None, :])[0]
-        # build_cloud applies R^T when the AHRS turned out to report
-        # world->sensor; the overlay has to make the same choice.
-        return R.T if self._transpose else R
-
-    def _update_orientation(self, quat):
-        """Redraw the attitude triad from whatever pose the cloud is using."""
-        if not self.orient_chk.isChecked():
-            return
-        R = self._pose_matrix(quat)
-        if R is None:
-            return
-        # The overlay lives in the same world as the cloud, so it takes the
-        # same upright correction. Without this the triad would keep pointing
-        # the old way and contradict the points it is drawn among.
-        if self.flip_chk.isChecked():
-            R = np.diag([1.0, -1.0, -1.0]) @ R
-
-        for it, axis in zip(self.axis_items, np.eye(3)):
-            seg = np.zeros((2, 3))
-            seg[1] = R @ (axis * self.AXIS_LEN)
-            it.setData(pos=seg)
-
-        # The scan plane: a circle in the sensor's XY at the beam standoff,
-        # pushed through the same rotation the points get.
-        t = np.linspace(0, 2 * np.pi, 65)
-        ring = np.stack([np.cos(t) * self.AXIS_LEN * 0.75,
-                         np.sin(t) * self.AXIS_LEN * 0.75,
-                         np.full_like(t, self.offset_spin.value())], axis=-1)
-        self.plane_item.setData(pos=ring @ R.T)
-
-        # Euler angles for the readout only -- the maths uses the quaternion.
-        pitch = np.degrees(np.arcsin(np.clip(-R[2, 0], -1.0, 1.0)))
-        roll = np.degrees(np.arctan2(R[2, 1], R[2, 2]))
-        yaw = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
-        # Say which source is on screen: the two disagree (that is the point of
-        # having the switch), so an unlabelled readout is unreadable.
-        src = "stepper" if self.stepper_chk.isChecked() else "IMU"
-        self.orient_lbl.setText(
-            f"{src}: roll {roll:+7.1f}  pitch {pitch:+7.1f}  yaw {yaw:+7.1f}")
 
     def _on_status(self, telem):
         # Indexed via the named constants in scan_proto, because the record has
@@ -1349,21 +1223,15 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.state = int(telem[sp.TEL_STATE])
         platform = telem[sp.TEL_PLATFORM]
         dropped = int(telem[sp.TEL_DROPPED])
-        # Stash it before drawing: the stepper-mode triad is built from this
-        # angle, not from the quaternion.
         self.platform = float(platform)
-        self._last_quat = telem[sp.TEL_QUAT]
-        self._update_orientation(self._last_quat)
         name = sp.STATE_NAMES.get(self.state, "?")
         self.state_lbl.setText(
             f"{name} - platform {platform:+.1f} deg"
             + (f" - {dropped} dropped" if dropped else ""))
 
-        # Progress is the platform's position across the sweep in both modes:
+        # Progress is the shaft's position across the sweep in both modes:
         # stepped runs through the same -span..+span, just discontinuously.
-        if self.state in sp.CAPTURE_STATES or self.state in (
-                sp.STATE_STEP_MOVE, sp.STATE_STEP_SETTLE,
-                sp.STATE_STEP_AVERAGE):
+        if self.state in sp.SWEEP_STATES:
             span = self.angle_spin.value()
             frac = (platform + span) / (2 * span) if span else 0.0
             self.progress.setValue(int(np.clip(frac, 0, 1) * 100))
@@ -1437,42 +1305,14 @@ class ScannerUI(QtWidgets.QMainWindow):
         # rest of the session.
         self._built_n = len(self.cap)
 
-        # Resolve the auto offset here rather than inside build_cloud, so the
-        # measured value lands back in the spinbox where it can be sanity
-        # checked -- and so switching auto off leaves that value behind as the
-        # starting point for a manual tweak instead of snapping back to zero.
-        tilt_offset = self.tilt_off_spin.value()
-        if self.stepper_chk.isChecked() and self.tilt_auto_chk.isChecked():
-            est = sp.estimate_tilt_offset(self.cap)
-            if est is not None:
-                tilt_offset = est
-                self.tilt_off_spin.blockSignals(True)
-                self.tilt_off_spin.setValue(est)
-                self.tilt_off_spin.blockSignals(False)
-        # Resolve the sensor->world vs world->sensor convention once and reuse
-        # it, rather than letting build_cloud re-decide (and re-log) it on every
-        # 4 Hz tick. Caching it also gives the attitude overlay something to
-        # match, so the triad and the points agree about which way is which.
-        # Wait for enough telemetry to decide with: resolve_frame falls back to
-        # False when it has fewer than 5 records, and caching that early guess
-        # would pin the whole session to it.
-        if not self.stepper_chk.isChecked() and self._transpose is None \
-                and len(self.cap.telem) >= 5:
-            try:
-                self._transpose = bool(sp.resolve_frame(self.cap))
-            except SystemExit:
-                pass
         try:
             xyz, dist, _ = sp.build_cloud(
                 self.cap,
                 max_range=self.range_spin.value() or None,
-                transpose=self._transpose,
-                from_stepper=self.stepper_chk.isChecked(),
                 beam_offset=self.offset_spin.value(),
                 lidar_rotation=self.lidar_rot_spin.value(),
                 lidar_reverse=self.reverse_chk.isChecked(),
-                flip_upright=self.flip_chk.isChecked(),
-                tilt_offset=tilt_offset)
+                flip_upright=self.flip_chk.isChecked())
         except SystemExit:
             return  # no sweep data yet
         if self.voxel_spin.value():
@@ -1598,7 +1438,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         if style == "height":
             # Same ramp the points use, so switching modes does not also
             # change what the colours mean.
-            kwargs["vertexColors"] = scan3d.colorize(verts[:, 2])
+            kwargs["vertexColors"] = cloud_io.colorize(verts[:, 2])
         md = gl.MeshData(vertexes=verts, faces=faces, **kwargs)
 
         self.mesh_item.setMeshData(meshdata=md)
@@ -1647,7 +1487,7 @@ class ScannerUI(QtWidgets.QMainWindow):
             rgba[:, 3] = 1.0
         else:
             v = xyz[:, 2] if self.color_box.currentText() == "height" else dist
-            rgba = scan3d.colorize(v)
+            rgba = cloud_io.colorize(v)
         self.scatter.setData(pos=xyz.astype(np.float32), color=rgba,
                              size=self.size_spin.value())
         if self._geometry_mode():
@@ -1686,17 +1526,14 @@ class ScannerUI(QtWidgets.QMainWindow):
             xyz, dist, _ = sp.build_cloud(
                 self.cap,
                 max_range=self.range_spin.value() or None,
-                transpose=self._transpose,
-                from_stepper=self.stepper_chk.isChecked(),
                 beam_offset=self.offset_spin.value(),
                 lidar_rotation=self.lidar_rot_spin.value(),
                 lidar_reverse=self.reverse_chk.isChecked(),
-                flip_upright=self.flip_chk.isChecked(),
-                tilt_offset=self.tilt_off_spin.value())
+                flip_upright=self.flip_chk.isChecked())
         except SystemExit:
             self._log("failed to build cloud for saving")
             return
-        scan3d.export_ply(path, xyz, dist)
+        cloud_io.export_ply(path, xyz, dist)
         self._log(f"saved {xyz.shape[0]} points -> {os.path.basename(path)}")
 
     def _save_bin(self):
@@ -1746,7 +1583,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         if path.lower().endswith(".stl"):
             meshing.export_stl(path, verts, faces)
         else:
-            rgb = (scan3d.colorize(verts[:, 2])[:, :3] * 255).astype(np.uint8)
+            rgb = (cloud_io.colorize(verts[:, 2])[:, :3] * 255).astype(np.uint8)
             meshing.export_ply(path, verts, faces, rgb)
         self._log(f"saved {len(faces)} triangles -> {os.path.basename(path)}")
 
@@ -1756,7 +1593,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            xyz, rgb = scan3d.load_ply(path)
+            xyz, rgb = cloud_io.load_ply(path)
         except Exception as exc:
             self._log(f"load failed: {exc}")
             return
