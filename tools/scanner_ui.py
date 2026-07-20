@@ -62,6 +62,11 @@ SCROLLBAR_OFF = _enum(QtCore.Qt, "ScrollBarPolicy.ScrollBarAlwaysOff",
                       "ScrollBarAlwaysOff")
 SCROLLBAR_AUTO = _enum(QtCore.Qt, "ScrollBarPolicy.ScrollBarAsNeeded",
                        "ScrollBarAsNeeded")
+STRONG_FOCUS = _enum(QtCore.Qt, "FocusPolicy.StrongFocus", "StrongFocus")
+
+
+def _key(name):
+    return _enum(QtCore.Qt, f"Key.Key_{name}", f"Key_{name}")
 
 
 # --- Collapsible section ----------------------------------------------------
@@ -342,6 +347,164 @@ def _studio_shader():
 
 # --- Meshing worker ---------------------------------------------------------
 
+CAM_ORBIT, CAM_FPS = "orbit", "fps"
+
+
+def _vec3(v):
+    """pyqtgraph Vector / QVector3D -> plain (3,) array."""
+    return np.array([v.x(), v.y(), v.z()], dtype=float)
+
+
+class SceneView(gl.GLViewWidget):
+    """The 3D view, with a second camera style bolted on.
+
+    Orbit mode is stock pyqtgraph: the camera swings around a fixed centre,
+    which is what Blender-ish tools do and what suits inspecting one cloud.
+
+    FPS mode reuses the same machinery instead of tracking its own pose. The
+    camera's position is a function of centre/azimuth/elevation, so looking
+    around means turning as usual and then sliding the centre so the *eye*
+    lands back where it was -- rotation about the head rather than about the
+    scene. Walking is then just a translation of the centre. Keeping one pose
+    representation means switching modes never jumps the view, and everything
+    that reads the camera (framing, the shader's eye-space lights) is unaware
+    there are two modes at all.
+    """
+
+    # Eye-to-centre distance held while flying. Small enough that the centre
+    # is effectively the head, large enough to stay clear of the near plane.
+    FPS_DISTANCE = 100.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cam_mode = CAM_ORBIT
+        self._orbit_distance = None   # remembered across a trip into FPS
+        self._held = set()
+        self.speed = 1500.0           # mm/s at a walk
+        self.setFocusPolicy(STRONG_FOCUS)
+        self._tick = QtCore.QTimer(self)
+        self._tick.setInterval(16)
+        self._tick.timeout.connect(self._fly)
+        self._last_t = None
+
+    # --- mode ---------------------------------------------------------------
+
+    def set_cam_mode(self, mode):
+        if mode == self.cam_mode:
+            return
+        if mode == CAM_FPS:
+            # Stand where the camera already is, looking the same way.
+            eye = _vec3(self.cameraPosition())
+            self._orbit_distance = self.opts["distance"]
+            self.opts["distance"] = self.FPS_DISTANCE
+            self._place(eye)
+            self._last_t = time.monotonic()
+            self._tick.start()
+        else:
+            self._tick.stop()
+            self._held.clear()
+            # Pull the centre back out to a sane orbit radius along the
+            # current view direction, so the scene stays in front of you.
+            eye = _vec3(self.cameraPosition())
+            self.opts["distance"] = self._orbit_distance or 4000.0
+            self._place(eye)
+        self.cam_mode = mode
+        self.update()
+
+    def _forward(self):
+        """Unit vector from the eye towards the centre."""
+        el = np.radians(self.opts["elevation"])
+        az = np.radians(self.opts["azimuth"])
+        return -np.array([np.cos(el) * np.cos(az),
+                          np.cos(el) * np.sin(az),
+                          np.sin(el)])
+
+    def _place(self, eye):
+        """Move the centre so the eye sits at `eye` for the current angles."""
+        c = np.asarray(eye) + self._forward() * self.opts["distance"]
+        self.opts["center"] = pg.Vector(*c)
+
+    # --- looking ------------------------------------------------------------
+
+    def mouseMoveEvent(self, ev):
+        if self.cam_mode != CAM_FPS:
+            return super().mouseMoveEvent(ev)
+        pos = ev.position() if hasattr(ev, "position") else ev.localPos()
+        if self.mousePos is None:
+            self.mousePos = pos
+        diff = pos - self.mousePos
+        self.mousePos = pos
+        eye = _vec3(self.cameraPosition())
+        # Opposite sign to orbiting, on both axes. Orbiting drags the *scene*:
+        # pull right and the object turns right, so the camera goes left. Here
+        # the drag moves the head, so right means look right -- which is the
+        # same swap Unity's scene view makes between its orbit and fly modes.
+        self.opts["azimuth"] -= diff.x() * 0.5
+        self.opts["elevation"] = float(
+            np.clip(self.opts["elevation"] + diff.y() * 0.5, -89.9, 89.9))
+        self._place(eye)
+        self.update()
+
+    def wheelEvent(self, ev):
+        if self.cam_mode != CAM_FPS:
+            return super().wheelEvent(ev)
+        # Zooming has no meaning without an orbit radius; spend the wheel on
+        # how fast you walk instead, which is the thing you actually retune.
+        delta = ev.angleDelta().y() if hasattr(ev, "angleDelta") else ev.delta()
+        self.speed = float(np.clip(self.speed * 1.15 ** (delta / 120.0),
+                                   50.0, 50000.0))
+
+    # --- walking ------------------------------------------------------------
+
+    def keyPressEvent(self, ev):
+        if self.cam_mode == CAM_FPS and not ev.isAutoRepeat():
+            self._held.add(ev.key())
+        super().keyPressEvent(ev)
+
+    def keyReleaseEvent(self, ev):
+        if not ev.isAutoRepeat():
+            self._held.discard(ev.key())
+        super().keyReleaseEvent(ev)
+
+    def focusOutEvent(self, ev):
+        # Keys released while another widget had focus never reach us, so a
+        # click on the side panel would otherwise leave the camera drifting.
+        self._held.clear()
+        super().focusOutEvent(ev)
+
+    def _fly(self):
+        now = time.monotonic()
+        dt, self._last_t = now - (self._last_t or now), now
+        if not self._held:
+            return
+        fwd = self._forward()
+        up = np.array([0.0, 0.0, 1.0])
+        right = np.cross(fwd, up)
+        n = np.linalg.norm(right)
+        # Looking straight up or down leaves no unique "right"; hold the last
+        # usable one by falling back to the world axis rather than dividing by
+        # zero and flinging the camera off.
+        right = right / n if n > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+        move = np.zeros(3)
+        for keys, vec in ((("W", "Up"), fwd), (("S", "Down"), -fwd),
+                          (("D", "Right"), right), (("A", "Left"), -right),
+                          (("E", "Space"), up), (("Q", "Control"), -up)):
+            if any(_key(k) in self._held for k in keys):
+                move += vec
+        if not move.any():
+            return
+        # Shift comes from the held set like everything else, not from
+        # QApplication.keyboardModifiers(): that reports the modifiers of the
+        # last event Qt delivered, and this timer fires with no events in
+        # between, so it lagged a keystroke behind -- the boost arrived on
+        # release rather than on press.
+        fast = 4.0 if _key("Shift") in self._held else 1.0
+        step = move / np.linalg.norm(move) * self.speed * fast * dt
+        self.opts["center"] = pg.Vector(*(_vec3(self.opts["center"]) + step))
+        self.update()
+
+
 class MeshWorker(QtCore.QThread):
     """Runs one reconstruction off the GUI thread.
 
@@ -469,7 +632,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         side.addWidget(self.log, 1)
 
         # --- 3D view ---
-        self.view = gl.GLViewWidget()
+        self.view = SceneView()
         self.view.setCameraPosition(distance=4000, elevation=20, azimuth=45)
         grid = gl.GLGridItem()
         grid.setSize(10000, 10000)
@@ -539,14 +702,20 @@ class ScannerUI(QtWidgets.QMainWindow):
         f = QtWidgets.QGridLayout(g)
 
         self.angle_spin = QtWidgets.QDoubleSpinBox()
-        self.angle_spin.setRange(1.0, 90.0)
+        self.angle_spin.setRange(1.0, 180.0)
         self.angle_spin.setValue(90.0)
         self.angle_spin.setSuffix(" deg")
         self.angle_spin.setToolTip(
             "Half-sweep: the shaft runs -this to +this about the vertical.\n"
-            "90 is the whole scene. The lidar's scan plane is vertical, so half "
-            "a turn of the shaft already carries it through every azimuth -- "
-            "there is nothing past 90 that has not been scanned already.")
+            "90 already covers the whole scene in both-halves mode, because "
+            "the lidar's scan plane is vertical and half a turn carries it "
+            "through every azimuth.\n"
+            "Anything past 90 is still allowed there, and re-scans what it "
+            "passes over a second time: more shots per surface, and a full "
+            "180 means every direction is seen from both sides of the sweep.\n"
+            "One-side scanning (see 'Scan half' in the View panel) *needs* "
+            "180: half a scan plane is a pole-to-pole arc, so it takes the "
+            "whole turn to cover the same sphere.")
         f.addWidget(QtWidgets.QLabel("Angle  ±"), 0, 0)
         f.addWidget(self.angle_spin, 0, 1)
 
@@ -593,6 +762,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         f.addWidget(self.est_lbl, 5, 0, 1, 2)
         for w in (self.steps_spin, self.dwell_spin, self.angle_spin):
             w.valueChanged.connect(self._update_estimate)
+        self.angle_spin.valueChanged.connect(self._on_half_changed)
 
         self.start_btn = QtWidgets.QPushButton("Start scan")
         self.start_btn.setToolTip(
@@ -604,50 +774,24 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.stop_btn.clicked.connect(self._stop)
         f.addWidget(self.stop_btn, 6, 1)
 
-        self.home_btn = QtWidgets.QPushButton("Set home")
-        self.home_btn.setToolTip("Call the current shaft angle zero")
-        self.home_btn.clicked.connect(lambda: self._send("h"))
-        f.addWidget(self.home_btn, 7, 0, 1, 2)
-
-        # The lidar's tether runs up the shaft and twists with it. These take a
-        # quarter turn out of that twist and call where the shaft landed home,
-        # which is the part that matters: the sweep is symmetric about home, so
-        # without re-homing the next scan would drive straight back through the
-        # turn just taken out and wind the tether right back up.
-        unwrap_lbl = QtWidgets.QLabel("Unwrap cable")
-        unwrap_lbl.setToolTip(
-            "Turns the shaft 90 deg to unwind the lidar's tether, then treats "
-            "that position as the new home.\n"
-            "Watch which way the cable is wound and press the matching "
-            "direction. The scene rotates with home, so scans taken either "
-            "side of an unwrap are 90 deg apart.")
-        f.addWidget(unwrap_lbl, 8, 0, 1, 2)
-
-        self.unwrap_ccw_btn = QtWidgets.QPushButton("↺  −90°")
-        self.unwrap_ccw_btn.setToolTip("Turn the shaft 90 deg anticlockwise, "
-                                       "then re-home")
-        self.unwrap_ccw_btn.clicked.connect(lambda: self._unwrap(-90.0))
-        f.addWidget(self.unwrap_ccw_btn, 9, 0)
-
-        self.unwrap_cw_btn = QtWidgets.QPushButton("↻  +90°")
-        self.unwrap_cw_btn.setToolTip("Turn the shaft 90 deg clockwise, "
-                                      "then re-home")
-        self.unwrap_cw_btn.clicked.connect(lambda: self._unwrap(90.0))
-        f.addWidget(self.unwrap_cw_btn, 9, 1)
-
+        # No unwrap or re-home buttons. The tether does twist as the shaft
+        # turns, but the coils are released whenever the rig is idle
+        # (SCAN_IDLE_DISABLE_MS in scanner.h), so the shaft is backdrivable and
+        # the twist comes out by hand. The firmware's 'h' and 'u' commands
+        # still exist if a future rig holds torque.
         self.clear_btn = QtWidgets.QPushButton("Clear scene")
         self.clear_btn.setToolTip(
             "Drop the points collected so far and start the cloud over. The "
             "raw .bin recording is untouched, so nothing is actually lost.")
         self.clear_btn.clicked.connect(self._clear_scene)
-        f.addWidget(self.clear_btn, 10, 0, 1, 2)
+        f.addWidget(self.clear_btn, 8, 0, 1, 2)
 
         self.progress = QtWidgets.QProgressBar()
         self.progress.setTextVisible(True)
-        f.addWidget(self.progress, 11, 0, 1, 2)
+        f.addWidget(self.progress, 9, 0, 1, 2)
 
         self.state_lbl = QtWidgets.QLabel("idle")
-        f.addWidget(self.state_lbl, 12, 0, 1, 2)
+        f.addWidget(self.state_lbl, 10, 0, 1, 2)
 
         self._on_mode_changed()
         return g
@@ -705,20 +849,10 @@ class ScannerUI(QtWidgets.QMainWindow):
         f.addWidget(QtWidgets.QLabel("Max range"), 4, 0)
         f.addWidget(self.range_spin, 4, 1)
 
-        self.offset_spin = QtWidgets.QDoubleSpinBox()
-        self.offset_spin.setRange(-500.0, 500.0)
-        self.offset_spin.setValue(sp.BEAM_OFFSET_MM)
-        self.offset_spin.setSuffix(" mm")
-        self.offset_spin.setToolTip(
-            "How far the lidar's beam origin sits off the rotation axis, along "
-            "its own spin axis.\n"
-            "Zero on this rig -- the sensor is centred on the shaft -- but a "
-            "few millimetres of it shows up as doubled or thickened walls, and "
-            "it is the only mount error that is not a pure rotation.")
-        self.offset_spin.valueChanged.connect(self._rebuild)
-        f.addWidget(QtWidgets.QLabel("Axis offset"), 5, 0)
-        f.addWidget(self.offset_spin, 5, 1)
-
+        # No axis-offset control: the lidar is centred on the shaft, so the
+        # standoff is zero and there is nothing to dial in. build_cloud still
+        # takes the parameter (it defaults to sp.BEAM_OFFSET_MM = 0) for a rig
+        # that one day mounts the sensor off-centre.
         self.lidar_rot_spin = QtWidgets.QDoubleSpinBox()
         self.lidar_rot_spin.setRange(-180.0, 180.0)
         self.lidar_rot_spin.setValue(sp.LIDAR_ROTATION_DEG)
@@ -731,8 +865,8 @@ class ScannerUI(QtWidgets.QMainWindow):
             "climbs into the walls and a room comes out as a cone. Try "
             "0 / 90 / 180 / -90 and keep the one where the floor is flat.")
         self.lidar_rot_spin.valueChanged.connect(self._rebuild)
-        f.addWidget(QtWidgets.QLabel("Lidar roll"), 6, 0)
-        f.addWidget(self.lidar_rot_spin, 6, 1)
+        f.addWidget(QtWidgets.QLabel("Lidar roll"), 5, 0)
+        f.addWidget(self.lidar_rot_spin, 5, 1)
 
         self.reverse_chk = QtWidgets.QCheckBox("Reverse azimuth direction")
         self.reverse_chk.setChecked(sp.LIDAR_REVERSE)
@@ -744,7 +878,7 @@ class ScannerUI(QtWidgets.QMainWindow):
             "eye against a scene whose handedness you know -- text on a wall "
             "reading backwards is the giveaway.")
         self.reverse_chk.stateChanged.connect(self._rebuild)
-        f.addWidget(self.reverse_chk, 7, 0, 1, 2)
+        f.addWidget(self.reverse_chk, 6, 0, 1, 2)
 
         self.flip_chk = QtWidgets.QCheckBox("Flip upright (180 deg)")
         self.flip_chk.setChecked(sp.FLIP_UPRIGHT)
@@ -754,12 +888,88 @@ class ScannerUI(QtWidgets.QMainWindow):
             "A rigid transform, so it changes no measurement -- purely "
             "cosmetic, and safe to toggle on its own.")
         self.flip_chk.stateChanged.connect(self._rebuild)
-        f.addWidget(self.flip_chk, 8, 0, 1, 2)
+        f.addWidget(self.flip_chk, 7, 0, 1, 2)
+
+        # --- Rangefinder standoff -------------------------------------------
+        # The lidar body is centred on the shaft but the rangefinder inside it
+        # is not, and that lateral offset reverses sign between the two halves
+        # of each revolution -- which is what splits a flat table into two
+        # heights. These two controls are the two ways out; see the module
+        # header in scan_proto.py.
+        self.spacing_spin = QtWidgets.QDoubleSpinBox()
+        self.spacing_spin.setRange(-200.0, 200.0)
+        self.spacing_spin.setDecimals(1)
+        self.spacing_spin.setSingleStep(1.0)
+        self.spacing_spin.setValue(sp.EMITTER_SPACING_MM)
+        self.spacing_spin.setSuffix(" mm")
+        self.spacing_spin.setToolTip(
+            "Distance between the laser diode and the receiver inside the "
+            "lidar.\n"
+            "The rangefinder's reference point sits between the two optics, "
+            "off to one side of the spin axis, and that sideways offset "
+            "reverses as the head turns -- so a table scanned by one side of "
+            "the lidar comes out higher than the same table scanned by the "
+            "other. Half this value is used as the standoff.\n"
+            "This is the real fix for that artefact, and the only setting that "
+            "removes both the step between the two halves and the gentle bowl "
+            "within each one.\n"
+            "Measure it with calipers to get close, then tune: the step is "
+            "smallest at the true value and grows about equally either side of "
+            "it, so if a flat surface still steps, try moving this both up and "
+            "down -- the size tells you how far off you are, not which way.")
+        self.spacing_spin.valueChanged.connect(self._rebuild)
+        f.addWidget(QtWidgets.QLabel("Emitter spacing"), 8, 0)
+        f.addWidget(self.spacing_spin, 8, 1)
+
+        self.half_box = QtWidgets.QComboBox()
+        for key in (sp.SCAN_HALF_BOTH, sp.SCAN_HALF_A, sp.SCAN_HALF_B):
+            self.half_box.addItem(sp.SCAN_HALF_NAMES[key], key)
+        self.half_box.setToolTip(
+            "Which half of each lidar revolution to keep, split at straight up "
+            "and straight down.\n"
+            "Keeping one side never mixes the two, so a flat surface cannot "
+            "arrive as two sheets. It does NOT replace the spacing above: the "
+            "remaining error stops being a step and becomes a gentle bowl, "
+            "which is easier to mesh but no more accurate. Set the spacing "
+            "first, then use this as insurance against the two optical paths "
+            "not being quite symmetric.\n"
+            "The cost is half the points, and half a scan plane is a "
+            "pole-to-pole arc rather than a full circle -- so it needs a 360 "
+            "deg sweep to cover the sphere: set Angle to ±180.\n"
+            "A and B are the two sides; pick whichever looks cleaner.")
+        self.half_box.currentIndexChanged.connect(self._on_half_changed)
+        f.addWidget(QtWidgets.QLabel("Scan half"), 9, 0)
+        f.addWidget(self.half_box, 9, 1)
+
+        self.half_lbl = QtWidgets.QLabel("")
+        self.half_lbl.setWordWrap(True)
+        self.half_lbl.setStyleSheet("color: #b26a00;")
+        f.addWidget(self.half_lbl, 10, 0, 1, 2)
+
+        self.cam_box = QtWidgets.QComboBox()
+        self.cam_box.addItem("Orbit (Blender)", CAM_ORBIT)
+        self.cam_box.addItem("Fly / FPS (Unity)", CAM_FPS)
+        self.cam_box.setToolTip(
+            "Orbit: drag swings the camera around a fixed point, wheel zooms "
+            "in and out of it. Best for turning one object over.\n"
+            "Fly: drag looks around from where you stand, WASD walks, "
+            "E / Space up and Q / Ctrl down, Shift for four times the speed, "
+            "and the wheel sets that speed rather than zooming. Best for "
+            "getting inside a scanned room.\n"
+            "Click the 3D view first -- the keys go to whatever has focus.")
+        self.cam_box.currentIndexChanged.connect(self._on_cam_mode_changed)
+        f.addWidget(QtWidgets.QLabel("Camera"), 11, 0)
+        f.addWidget(self.cam_box, 11, 1)
 
         b = QtWidgets.QPushButton("Reset camera")
         b.clicked.connect(self._frame_cloud)
-        f.addWidget(b, 9, 0, 1, 2)
+        f.addWidget(b, 12, 0, 1, 2)
         return g
+
+    def _on_cam_mode_changed(self):
+        self.view.set_cam_mode(self.cam_box.currentData())
+        if self.cam_box.currentData() == CAM_FPS:
+            self.view.setFocus()
 
     def _geometry_group(self):
         """Surface reconstruction settings. Only on screen in Geometry mode."""
@@ -960,6 +1170,7 @@ class ScannerUI(QtWidgets.QMainWindow):
             "view/mode": self.mode_box,
             "view/color_by": self.color_box,
             "view/point_size": self.size_spin,
+            "view/camera": self.cam_box,
             "mesh/method": self.algo_box,
             "mesh/depth": self.depth_spin,
             "mesh/trim": self.trim_spin,
@@ -970,9 +1181,10 @@ class ScannerUI(QtWidgets.QMainWindow):
             "mesh/surface": self.surface_box,
             "view/voxel": self.voxel_spin,
             "view/max_range": self.range_spin,
-            "geom/beam_offset": self.offset_spin,
             "geom/lidar_rotation": self.lidar_rot_spin,
             "geom/lidar_reverse": self.reverse_chk,
+            "geom/emitter_spacing": self.spacing_spin,
+            "geom/scan_half": self.half_box,
             "geom/flip_upright": self.flip_chk,
         }
         self._restore_settings()
@@ -1011,7 +1223,9 @@ class ScannerUI(QtWidgets.QMainWindow):
             finally:
                 w.blockSignals(False)
         self._on_mode_changed()
+        self._on_half_changed()
         self._on_algo_changed()
+        self._on_cam_mode_changed()
         # Last, and unconditionally: it decides which half of the panel is
         # visible, so it has to run even when nothing was restored.
         self._on_view_mode_changed()
@@ -1109,6 +1323,18 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.time_spin.setEnabled(not stepped)
         self._update_estimate()
 
+    def _on_half_changed(self):
+        """One-side scanning needs a full turn; say so rather than silently
+        reconstructing half a sphere from half a sweep."""
+        one_side = self.half_box.currentData() != sp.SCAN_HALF_BOTH
+        if one_side and self.angle_spin.value() < 180.0:
+            self.half_lbl.setText(
+                "One-side scanning covers only half the scene at this angle - "
+                "set Angle to ±180 for a full 360° sweep.")
+        else:
+            self.half_lbl.setText("")
+        self._rebuild()
+
     def _update_estimate(self):
         if not self.stepped_chk.isChecked():
             self.est_lbl.setText("")
@@ -1136,18 +1362,6 @@ class ScannerUI(QtWidgets.QMainWindow):
             self._send(f"n{self.steps_spin.value()}")
             self._send(f"d{self.dwell_spin.value()}")
         return True
-
-    def _unwrap(self, deg):
-        """Turn the shaft to unwind the tether, and re-home where it lands.
-
-        Re-homing is done by the firmware, not here, and it is the point of the
-        command: the sweep is symmetric about home, so a turn that did not move
-        home with it would be undone by the very next scan.
-        """
-        if self.state not in (sp.STATE_IDLE, sp.STATE_DONE):
-            self._log("cannot unwrap mid-sweep")
-            return
-        self._send(f"u{deg:.1f}")
 
     def _clear_scene(self):
         """Throw away the points collected so far and start the cloud over.
@@ -1309,10 +1523,11 @@ class ScannerUI(QtWidgets.QMainWindow):
             xyz, dist, _ = sp.build_cloud(
                 self.cap,
                 max_range=self.range_spin.value() or None,
-                beam_offset=self.offset_spin.value(),
                 lidar_rotation=self.lidar_rot_spin.value(),
                 lidar_reverse=self.reverse_chk.isChecked(),
-                flip_upright=self.flip_chk.isChecked())
+                flip_upright=self.flip_chk.isChecked(),
+                emitter_spacing=self.spacing_spin.value(),
+                half=self.half_box.currentData())
         except SystemExit:
             return  # no sweep data yet
         if self.voxel_spin.value():
@@ -1526,10 +1741,11 @@ class ScannerUI(QtWidgets.QMainWindow):
             xyz, dist, _ = sp.build_cloud(
                 self.cap,
                 max_range=self.range_spin.value() or None,
-                beam_offset=self.offset_spin.value(),
                 lidar_rotation=self.lidar_rot_spin.value(),
                 lidar_reverse=self.reverse_chk.isChecked(),
-                flip_upright=self.flip_chk.isChecked())
+                flip_upright=self.flip_chk.isChecked(),
+                emitter_spacing=self.spacing_spin.value(),
+                half=self.half_box.currentData())
         except SystemExit:
             self._log("failed to build cloud for saving")
             return

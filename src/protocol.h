@@ -99,13 +99,19 @@ static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
 // Guard rails for the above, so a fat-fingered UI value cannot drive the
 // platform into its end stops or ask for a step rate the motor cannot hold.
 //
-// SCAN_DEGREES_MAX is 90 because the sweep is symmetric about home and the
-// lidar's own scan plane is vertical: half a turn of the shaft already carries
-// that plane through every azimuth, so 180 degrees of travel is a whole sphere
-// and anything past it only rescans what has been scanned and winds more twist
-// into the tether.
+// The sweep is symmetric about home, so the travel is twice SCAN_DEGREES.
+//
+// 90 (a 180 degree sweep) is enough to cover the whole sphere, because the
+// lidar's scan plane is vertical and half a turn of the shaft already carries
+// that full plane through every azimuth.
+//
+// 180 (a 360 degree sweep) is for one-side scanning, where the host keeps only
+// half of each lidar revolution to dodge the rangefinder's lateral standoff.
+// Half a plane is a pole-to-pole arc rather than a full circle, so it needs the
+// whole turn to sweep the sphere. Past that nothing new is scanned and the
+// tether only takes on more twist.
 #define SCAN_DEGREES_MIN 1.0f
-#define SCAN_DEGREES_MAX 90.0f
+#define SCAN_DEGREES_MAX 180.0f
 #define SCAN_TIME_MIN    2.0f
 #define SCAN_TIME_MAX    600.0f
 #define SCAN_STEPS_MIN   2

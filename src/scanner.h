@@ -14,7 +14,11 @@
 // The lidar is bolted to the shaft with its scan plane vertical, and the shaft
 // turns about the world vertical axis. Half a turn therefore sweeps that
 // vertical plane through every azimuth and covers the whole sphere, which is
-// why the default half-sweep is the full 90 the limits allow: -90 -> +90.
+// why the default half-sweep is 90: -90 -> +90.
+//
+// A host doing one-side scanning -- keeping half of each lidar revolution to
+// dodge the rangefinder's lateral standoff -- asks for 180 instead, since half
+// a scan plane needs a whole shaft turn to cover the same sphere.
 //
 // Both of these are only the power-on defaults; the host can override them at
 // runtime with the 'a' and 't' commands.

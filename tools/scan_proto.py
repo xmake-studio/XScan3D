@@ -57,6 +57,78 @@ TEL_DROPPED = 4
 # and it is the only mount error that is not a pure rotation.
 BEAM_OFFSET_MM = 0.0
 
+# --- The lateral standoff, and why it splits flat surfaces in two -----------
+#
+# The lidar body sits on the axis, but the rangefinder inside it does not: the
+# laser diode and the receiver are separate optics roughly EMITTER_SPACING_MM
+# apart, and the range is referenced to a point between them. That reference
+# point is therefore offset from the spin axis *sideways* -- perpendicular to
+# the beam, within the scan plane -- and that offset turns with the head.
+#
+# Write the in-plane beam direction as u = (sin th, 0, cos th) and the in-plane
+# perpendicular as v = (cos th, 0, -sin th). A measured point lands at
+#
+#     P = d*u + b*v      so      P_z = d*cos(th) - b*sin(th)
+#
+# where b is the lateral standoff. The -b*sin(th) term is the whole problem: it
+# flips sign between the two halves of the lidar's revolution. A table top hit
+# on the way down one side (th ~ 150 deg) and again on the way down the other
+# (th ~ 210 deg) has almost the same cos(th) but opposite sin(th), so the same
+# physical surface reconstructs at two heights about b apart -- one side of the
+# table higher than the other. It is not noise and it does not average out.
+#
+# Getting b wrong does two distinct things, and it is worth keeping them apart
+# because the two cures below do not address them equally. Measured against a
+# simulated room with a true 15 mm standoff:
+#
+#     spacing   A-vs-B step   within-half warp
+#           0      12.87 mm           12.23 mm
+#          15       6.42 mm            6.48 mm
+#          30       0.04 mm            0.96 mm     <- true value
+#          45       6.52 mm            6.31 mm
+#
+#   * the STEP is the visible artefact: the surface built from one half sits
+#     bodily above the surface built from the other, so a table arrives as two
+#     sheets and a mesher bridges them into a staircase.
+#   * the WARP is the surface bending within a single half, because the error
+#     term varies smoothly with th across that half. It is a bowl rather than a
+#     step, so it survives meshing looking plausible while still being wrong.
+#
+# So the two cures are NOT equivalent:
+#
+#   * Setting EMITTER_SPACING_MM correctly is the real fix. It is the only one
+#     that removes both, and the table above is also how to tune it: the step
+#     is V-shaped in the error and bottoms out at the true value, so dial the
+#     number until a flat surface stops stepping. Being 15 mm out either way
+#     costs the same, which means the step tells you the magnitude but not the
+#     sign -- try both directions.
+#   * Keeping one half (SCAN_HALF_A / _B) removes the step *by construction*,
+#     since the two halves are never mixed, but leaves the warp untouched. It
+#     is insurance against the two optical paths not being symmetric in a way
+#     this one-parameter model cannot express -- not a substitute for getting
+#     the spacing right. Costs half the points and a 360 deg sweep.
+#
+# Best results use both: correct spacing, then one half.
+#
+# The reconstruction uses half of this value as the lateral standoff, which
+# assumes the axis is centred between the two optics. If it is not, this stops
+# being a spec and becomes purely a tuning knob.
+EMITTER_SPACING_MM = 30.0
+
+# Which half of each lidar revolution to keep. The split is at sin(th) == 0 --
+# straight up and straight down -- because that is exactly where the lateral
+# term above changes sign, so each half is internally consistent.
+#
+# One half-plane runs pole to pole, so yawing it a full 360 deg covers the whole
+# sphere; that is why one-side scanning needs twice the shaft travel that a
+# both-halves scan does, for half as many points.
+SCAN_HALF_BOTH, SCAN_HALF_A, SCAN_HALF_B = 0, 1, 2
+SCAN_HALF_NAMES = {
+    SCAN_HALF_BOTH: "both halves",
+    SCAN_HALF_A: "one side only (A)",
+    SCAN_HALF_B: "one side only (B)",
+}
+
 # The shaft turns about world Z: this is a plain yaw, and nothing else.
 SPIN_AXIS = (0.0, 0.0, 1.0)
 
@@ -417,13 +489,18 @@ def axis_angle_matrix(axis, deg):
 def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
                 beam_offset=BEAM_OFFSET_MM,
                 lidar_rotation=LIDAR_ROTATION_DEG,
-                lidar_reverse=LIDAR_REVERSE, flip_upright=FLIP_UPRIGHT):
+                lidar_reverse=LIDAR_REVERSE, flip_upright=FLIP_UPRIGHT,
+                emitter_spacing=EMITTER_SPACING_MM, half=SCAN_HALF_BOTH):
     """Reconstruct the 3D point cloud.
 
     Returns (xyz, dist, platform_deg). Each sample carries the shaft angle it
     was taken at, so there is no interpolation and no pose estimation here: the
     8 points of a frame are spread across the azimuth gap to the next frame,
     lifted into the vertical scan plane, and yawed by that frame's shaft angle.
+
+    `emitter_spacing` corrects the rangefinder's lateral standoff and `half`
+    discards one side of each revolution; see the notes at the top of this
+    module for what they are for and why they are two answers to one problem.
     """
     col = cap.arrays()
     n = len(cap)
@@ -458,15 +535,33 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
     # happen here, before the shaft rotation, or the slice has already been
     # swung into place tipped. See LIDAR_ROTATION_DEG.
     th = np.radians((-az if lidar_reverse else az) + lidar_rotation)
+    sin_th, cos_th = np.sin(th), np.cos(th)
+
+    # Keep one half of each revolution, split at the poles where the lateral
+    # term below changes sign. Applied to `good` rather than to `k`, because the
+    # 8 points of a frame can straddle the boundary and the frame as a whole is
+    # on neither side.
+    if half == SCAN_HALF_A:
+        good &= sin_th >= 0.0
+    elif half == SCAN_HALF_B:
+        good &= sin_th < 0.0
 
     # The scan plane, at shaft angle 0. The lidar sweeps its own plane about its
     # spin axis with 0 deg at "+cos" turning clockwise; that plane is mounted
     # vertical, so the sin component runs out along world X and the cos
-    # component runs up world Z. The spin axis is then world Y, and the beam's
-    # standoff from the rotation axis lies along it.
-    p = np.stack([d * np.sin(th),
+    # component runs up world Z. The spin axis is then world Y, and the mount's
+    # own standoff from the rotation axis lies along it.
+    #
+    # The lateral term is the rangefinder's own offset inside the lidar: the
+    # range is referenced to a point b to the side of the spin axis, along the
+    # in-plane perpendicular v = (cos th, 0, -sin th). Half the emitter spacing,
+    # on the assumption the axis is centred between the two optics. Getting this
+    # wrong is what splits a flat surface into two heights -- see the module
+    # header.
+    b = 0.5 * emitter_spacing
+    p = np.stack([d * sin_th + b * cos_th,
                   np.full_like(d, beam_offset),
-                  d * np.cos(th)], axis=-1)
+                  d * cos_th - b * sin_th], axis=-1)
 
     # Yaw about world Z by the shaft angle. No transpose ambiguity, no drift,
     # no offset to solve for: this is the commanded angle of a sensor rigidly
