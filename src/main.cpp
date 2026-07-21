@@ -3,7 +3,6 @@
 #include "scanner.h"
 
 #define RED_LASER_PIN 29
-#define ARGB_LED_PIN  16
 
 // Everything runs on core0: the motor, the lidar UART and the USB protocol.
 // There used to be an AHRS on core1 fusing an IMU into a pose, because the

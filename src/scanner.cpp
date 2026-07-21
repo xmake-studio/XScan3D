@@ -17,6 +17,8 @@ void putMagic(uint8_t *p, uint8_t tag) {
 
 }  // namespace
 
+Adafruit_NeoPixel statusLed(1, STATUS_LED_PIN, NEO_GRB + NEO_KHZ800);
+
 // --- Geometry ---------------------------------------------------------------
 // The lidar sits on the shaft, so platform angle and motor angle are the same
 // number. These two exist anyway because everything below reads better for
@@ -38,6 +40,11 @@ float Scanner::stepAngle(uint16_t i) const {
   return -scanDegrees_ + (2.0f * scanDegrees_ * i) / steps_;
 }
 
+void setStatus(int r, int g, int b) {
+  statusLed.setPixelColor(0, statusLed.Color(r, g, b));
+  statusLed.show();
+}
+
 // --- Setup ------------------------------------------------------------------
 
 void Scanner::begin() {
@@ -46,11 +53,15 @@ void Scanner::begin() {
   // looks identical to dead firmware from the host's side.
   emitEvent("boot: scanner starting");
 
+  statusLed.begin();
+  statusLed.setBrightness(32);
+  setStatus(255, 0, 255);  // magenta: booting
+
   // The motor claims its pins first, so nothing else can take them later.
   motor_.begin(SCAN_MICROSTEP);
   motor_.setMaxSpeed(SCAN_TRAVEL_SPEED);
   motor_.setAcceleration(SCAN_TRAVEL_ACCEL);
-  motor_.enable();
+  //motor_.enable();
   // Wherever the rig happens to be sitting is angle zero until told otherwise.
   motor_.setCurrentPosition(0);
   emitEvent("boot: stepper on GPIO%d-%d, 1/%d step, %ld/rev",
@@ -67,6 +78,8 @@ void Scanner::begin() {
   emitConfig();
   emitEvent("ready: sweep %+.0f..%+.0f deg in %.0f s", -scanDegrees_,
             scanDegrees_, scanTime_);
+
+  setStatus(0, 255, 0);  // green: ready
 }
 
 // --- Emission ---------------------------------------------------------------
@@ -144,6 +157,7 @@ void Scanner::serviceIdlePower() {
   if (millis() - stateAt_ < SCAN_IDLE_DISABLE_MS) return;
 
   motor_.disable();
+  setStatus(0, 255, 0);  // green: motor disabled
   angleStale_ = true;
   emitEvent("motor: coils released at %+.2f deg (idle)", platformDeg());
 }
@@ -151,6 +165,7 @@ void Scanner::serviceIdlePower() {
 void Scanner::engageMotor() {
   if (motor_.isEnabled()) return;
   motor_.enable();
+  setStatus(255, 0, 0);  // red: motor enabled
   if (angleStale_) {
     angleStale_ = false;
     // Not an error -- with the coils cold the shaft turns freely, so this is

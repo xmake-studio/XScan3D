@@ -24,7 +24,7 @@ import numpy as np
 
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 import scan_proto as sp
 import cloud_io
@@ -63,6 +63,13 @@ SCROLLBAR_OFF = _enum(QtCore.Qt, "ScrollBarPolicy.ScrollBarAlwaysOff",
 SCROLLBAR_AUTO = _enum(QtCore.Qt, "ScrollBarPolicy.ScrollBarAsNeeded",
                        "ScrollBarAsNeeded")
 STRONG_FOCUS = _enum(QtCore.Qt, "FocusPolicy.StrongFocus", "StrongFocus")
+LEFT_BUTTON = _enum(QtCore.Qt, "MouseButton.LeftButton", "LeftButton")
+MIDDLE_BUTTON = _enum(QtCore.Qt, "MouseButton.MiddleButton", "MiddleButton")
+SHIFT_MOD = _enum(QtCore.Qt, "KeyboardModifier.ShiftModifier", "ShiftModifier")
+EV_KEY_PRESS = _enum(QtCore.QEvent, "Type.KeyPress", "KeyPress")
+EV_KEY_RELEASE = _enum(QtCore.QEvent, "Type.KeyRelease", "KeyRelease")
+EV_WINDOW_DEACTIVATE = _enum(QtCore.QEvent, "Type.WindowDeactivate",
+                             "WindowDeactivate")
 
 
 def _key(name):
@@ -375,8 +382,23 @@ class SceneView(gl.GLViewWidget):
     # is effectively the head, large enough to stay clear of the near plane.
     FPS_DISTANCE = 100.0
 
+    # Direction per key group as (forward, right, up) coefficients in the
+    # camera's frame. One table, so the keys the event filter claims cannot
+    # drift out of step with the keys walking actually honours.
+    MOVE_KEYS = {
+        ("W", "Up"): (1, 0, 0),
+        ("S", "Down"): (-1, 0, 0),
+        ("D", "Right"): (0, 1, 0),
+        ("A", "Left"): (0, -1, 0),
+        ("E", "Space"): (0, 0, 1),
+        ("Q", "Control"): (0, 0, -1),
+    }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.FLY_KEYS = frozenset(
+            [_key("Shift")]
+            + [_key(n) for group in self.MOVE_KEYS for n in group])
         self.cam_mode = CAM_ORBIT
         self._orbit_distance = None   # remembered across a trip into FPS
         self._held = set()
@@ -400,8 +422,10 @@ class SceneView(gl.GLViewWidget):
             self._place(eye)
             self._last_t = time.monotonic()
             self._tick.start()
+            QtWidgets.QApplication.instance().installEventFilter(self)
         else:
             self._tick.stop()
+            QtWidgets.QApplication.instance().removeEventFilter(self)
             self._held.clear()
             # Pull the centre back out to a sane orbit radius along the
             # current view direction, so the scene stays in front of you.
@@ -409,6 +433,35 @@ class SceneView(gl.GLViewWidget):
             self.opts["distance"] = self._orbit_distance or 4000.0
             self._place(eye)
         self.cam_mode = mode
+        self.update()
+
+    def setCameraPosition(self, pos=None, distance=None, elevation=None,
+                          azimuth=None, rotation=None):
+        """Framing, without letting it undo FPS mode.
+
+        In FPS mode the eye-to-centre distance is the whole trick: it is held
+        tiny so that turning pivots about the head. Stock framing writes a
+        scene-sized radius straight into opts['distance'], which silently
+        turned flying back into orbiting about a point tens of metres away --
+        the camera looked stuck, and toggling the mode was the only way back,
+        because that is where FPS_DISTANCE gets restored. So here framing means
+        standing back from the target and looking at it, and the requested
+        radius is remembered for the eventual return to orbit instead.
+        """
+        if self.cam_mode != CAM_FPS:
+            return super().setCameraPosition(pos, distance, elevation,
+                                             azimuth, rotation)
+        if rotation is not None:
+            raise ValueError("cannot set rotation while flying")
+        if elevation is not None:
+            self.opts["elevation"] = elevation
+        if azimuth is not None:
+            self.opts["azimuth"] = azimuth
+        if distance is not None:
+            self._orbit_distance = distance
+        target = _vec3(pos if pos is not None else self.opts["center"])
+        self.opts["distance"] = self.FPS_DISTANCE
+        self._place(target - self._forward() * (self._orbit_distance or 4000.0))
         self.update()
 
     def _forward(self):
@@ -426,11 +479,41 @@ class SceneView(gl.GLViewWidget):
 
     # --- looking ------------------------------------------------------------
 
+    def _orbit_move(self, ev):
+        """Orbit-mode dragging, with a pan that can lift the pivot.
+
+        Stock pyqtgraph pans with relative='view-upright', whose two axes both
+        lie in the world's horizontal plane: the pivot slides around the floor
+        and never leaves the height it was framed at. On a room scan that
+        height lands somewhere around the middle of the walls, and anything
+        below it -- the floor, the underside of furniture -- could only be
+        looked at from above, because there was no way to bring the point being
+        orbited down to it.
+
+        relative='view' instead pans in the plane of the screen, so a vertical
+        drag carries the pivot up and down through the scene exactly as
+        shift-drag does in Blender. Shift+left is bound to the same thing for
+        mice with no usable middle button.
+        """
+        pos = ev.position() if hasattr(ev, "position") else ev.localPos()
+        if getattr(self, "mousePos", None) is None:
+            self.mousePos = pos
+        diff = pos - self.mousePos
+        buttons = ev.buttons()
+        panning = (buttons == MIDDLE_BUTTON
+                   or (buttons == LEFT_BUTTON and ev.modifiers() & SHIFT_MOD))
+        if not panning:
+            return super().mouseMoveEvent(ev)
+        self.mousePos = pos
+        self.pan(diff.x(), diff.y(), 0, relative="view")
+
     def mouseMoveEvent(self, ev):
         if self.cam_mode != CAM_FPS:
-            return super().mouseMoveEvent(ev)
+            return self._orbit_move(ev)
         pos = ev.position() if hasattr(ev, "position") else ev.localPos()
-        if self.mousePos is None:
+        # pyqtgraph only creates mousePos on the first press, so it can be
+        # missing entirely rather than None.
+        if getattr(self, "mousePos", None) is None:
             self.mousePos = pos
         diff = pos - self.mousePos
         self.mousePos = pos
@@ -456,21 +539,52 @@ class SceneView(gl.GLViewWidget):
 
     # --- walking ------------------------------------------------------------
 
-    def keyPressEvent(self, ev):
-        if self.cam_mode == CAM_FPS and not ev.isAutoRepeat():
-            self._held.add(ev.key())
-        super().keyPressEvent(ev)
+    def eventFilter(self, obj, ev):
+        """Fly keys, taken from the application rather than from focus.
 
-    def keyReleaseEvent(self, ev):
+        Focus was the whole problem: WASD only reached the view while the view
+        itself was the focus widget, so any click on the side panel -- or just
+        the combo that turns FPS mode on keeping focus for itself -- left the
+        camera dead until the mode was toggled. setFocus() calls scattered over
+        press/enter patched individual routes into that state and still missed
+        most of them, which is why flying worked only some of the time.
+
+        So while flying, the keys are read here, before Qt routes them by
+        focus. A pointer over the view means the flying keys are ours no matter
+        what is focused, which is the Unity rule and lets you retune a spinbox
+        and fly again without a click in between. Off the view, only genuine
+        focus counts, so typing into that spinbox still types.
+        """
+        t = ev.type()
+        if t == EV_WINDOW_DEACTIVATE:
+            # Releases go to whoever has the keyboard next; without this the
+            # keys held at alt-tab stay held and the camera drifts on return.
+            self._held.clear()
+            return False
+        if t not in (EV_KEY_PRESS, EV_KEY_RELEASE):
+            return False
+        if not (self._pointer_over_view() or self.hasFocus()):
+            return False
+        if ev.key() not in self.FLY_KEYS:
+            return False
         if not ev.isAutoRepeat():
-            self._held.discard(ev.key())
-        super().keyReleaseEvent(ev)
+            if t == EV_KEY_PRESS:
+                self._held.add(ev.key())
+            else:
+                self._held.discard(ev.key())
+        return True
 
-    def focusOutEvent(self, ev):
-        # Keys released while another widget had focus never reach us, so a
-        # click on the side panel would otherwise leave the camera drifting.
-        self._held.clear()
-        super().focusOutEvent(ev)
+    def _pointer_over_view(self):
+        if not self.isVisible():
+            return False
+        return self.rect().contains(self.mapFromGlobal(QtGui.QCursor.pos()))
+
+    def mousePressEvent(self, ev):
+        # pyqtgraph's handler does not chain up, so nothing here can be assumed
+        # to have run; take focus explicitly rather than relying on Qt's
+        # click-to-focus surviving that.
+        self.setFocus()
+        super().mousePressEvent(ev)
 
     def _fly(self):
         now = time.monotonic()
@@ -487,11 +601,9 @@ class SceneView(gl.GLViewWidget):
         right = right / n if n > 1e-6 else np.array([1.0, 0.0, 0.0])
 
         move = np.zeros(3)
-        for keys, vec in ((("W", "Up"), fwd), (("S", "Down"), -fwd),
-                          (("D", "Right"), right), (("A", "Left"), -right),
-                          (("E", "Space"), up), (("Q", "Control"), -up)):
-            if any(_key(k) in self._held for k in keys):
-                move += vec
+        for names, (f, r, u) in self.MOVE_KEYS.items():
+            if any(_key(k) in self._held for k in names):
+                move += f * fwd + r * right + u * up
         if not move.any():
             return
         # Shift comes from the held set like everything else, not from
@@ -951,12 +1063,15 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.cam_box.addItem("Fly / FPS (Unity)", CAM_FPS)
         self.cam_box.setToolTip(
             "Orbit: drag swings the camera around a fixed point, wheel zooms "
-            "in and out of it. Best for turning one object over.\n"
+            "in and out of it. Middle-drag (or Shift+drag) slides that point "
+            "through the scene, sideways and up and down, as in Blender -- "
+            "use it to bring the floor into reach. Best for turning one "
+            "object over.\n"
             "Fly: drag looks around from where you stand, WASD walks, "
             "E / Space up and Q / Ctrl down, Shift for four times the speed, "
-            "and the wheel sets that speed rather than zooming. Best for "
-            "getting inside a scanned room.\n"
-            "Click the 3D view first -- the keys go to whatever has focus.")
+            "and the wheel sets that speed rather than zooming. The keys work "
+            "whenever the pointer is over the 3D view. Best for getting "
+            "inside a scanned room.")
         self.cam_box.currentIndexChanged.connect(self._on_cam_mode_changed)
         f.addWidget(QtWidgets.QLabel("Camera"), 11, 0)
         f.addWidget(self.cam_box, 11, 1)
@@ -969,7 +1084,11 @@ class ScannerUI(QtWidgets.QMainWindow):
     def _on_cam_mode_changed(self):
         self.view.set_cam_mode(self.cam_box.currentData())
         if self.cam_box.currentData() == CAM_FPS:
-            self.view.setFocus()
+            # Deferred: choosing an item leaves the combo taking focus back
+            # *after* this handler returns, so a setFocus() from in here is
+            # undone. Flying no longer depends on focus, but starting out with
+            # it on the view keeps the arrow keys off the dropdown.
+            QtCore.QTimer.singleShot(0, self.view.setFocus)
 
     def _geometry_group(self):
         """Surface reconstruction settings. Only on screen in Geometry mode."""
@@ -1177,7 +1296,6 @@ class ScannerUI(QtWidgets.QMainWindow):
             "mesh/radius": self.radius_spin,
             "mesh/alpha": self.alpha_spin,
             "mesh/smooth": self.smooth_spin,
-            "mesh/budget": self.budget_spin,
             "mesh/surface": self.surface_box,
             "view/voxel": self.voxel_spin,
             "view/max_range": self.range_spin,
@@ -1197,6 +1315,21 @@ class ScannerUI(QtWidgets.QMainWindow):
                 getattr(w, "stateChanged", None) or \
                 getattr(w, "currentTextChanged", None)
             sig.connect(self._save_settings)
+        # Not in _persist: it is keyed by the meshing method, see _saved_budget.
+        self.budget_spin.valueChanged.connect(self._save_settings)
+
+    def _saved_budget(self, method):
+        """Stored point budget for one meshing method, or None."""
+        # The panel calls _on_algo_changed while it is still being built, which
+        # is before _init_settings has run; the defaults stand until then.
+        settings = getattr(self, "settings", None)
+        if settings is None:
+            return None
+        val = settings.value(f"mesh/budget/{method}")
+        try:
+            return None if val is None else int(float(val))
+        except (TypeError, ValueError):
+            return None
 
     def _restore_settings(self):
         for key, w in self._persist.items():
@@ -1238,6 +1371,8 @@ class ScannerUI(QtWidgets.QMainWindow):
                 self.settings.setValue(key, w.currentText())
             else:
                 self.settings.setValue(key, w.value())
+        self.settings.setValue(f"mesh/budget/{self.algo_box.currentData()}",
+                               self.budget_spin.value())
         for key, sec in self.sections.items():
             self.settings.setValue(f"fold/{key}", sec.is_expanded())
 
@@ -1413,16 +1548,26 @@ class ScannerUI(QtWidgets.QMainWindow):
         deg = cfg[sp.CFG_DEGREES]
         secs = cfg[sp.CFG_TIME]
         stepped = int(cfg[sp.CFG_MODE]) == sp.MODE_STEPPED
-        # Adopt the device's values without echoing them straight back.
-        for w, val in ((self.angle_spin, deg), (self.time_spin, secs),
-                       (self.steps_spin, int(cfg[sp.CFG_STEPS])),
-                       (self.dwell_spin, int(cfg[sp.CFG_CAPTURE_MS]))):
+        # Adopt the device's values only for fields the user has never set.
+        # The board reports its own defaults on connect, and adopting those
+        # wholesale overwrote the restored angle/duration every session -- the
+        # settings looked like they were not being saved at all. What is on
+        # screen wins instead; _push_settings sends it before the scan starts.
+        for key, w, val in (("scan/angle", self.angle_spin, deg),
+                            ("scan/time", self.time_spin, secs),
+                            ("scan/steps", self.steps_spin,
+                             int(cfg[sp.CFG_STEPS])),
+                            ("scan/dwell", self.dwell_spin,
+                             int(cfg[sp.CFG_CAPTURE_MS])),
+                            ("scan/stepped", self.stepped_chk, stepped)):
+            if self.settings.value(key) is not None:
+                continue
             w.blockSignals(True)
-            w.setValue(val)
+            if isinstance(w, QtWidgets.QCheckBox):
+                w.setChecked(val)
+            else:
+                w.setValue(val)
             w.blockSignals(False)
-        self.stepped_chk.blockSignals(True)
-        self.stepped_chk.setChecked(stepped)
-        self.stepped_chk.blockSignals(False)
         self._on_mode_changed()
 
         self._log(f"device config: ±{deg:.1f} deg, "
@@ -1573,8 +1718,10 @@ class ScannerUI(QtWidgets.QMainWindow):
         # Adopt this method's budget. The methods' costs differ by an order of
         # magnitude at the same point count, so carrying one number across a
         # switch means either wasting Poisson's headroom or walking into a
-        # ball-pivoting build that takes twenty minutes.
-        want = meshing.METHOD_BUDGET.get(method)
+        # ball-pivoting build that takes twenty minutes. The budget is stored
+        # per method for the same reason: a single saved number would be reset
+        # to the default of whichever method was restored.
+        want = self._saved_budget(method) or meshing.METHOD_BUDGET.get(method)
         if want and self.budget_spin.value() != want:
             self.budget_spin.blockSignals(True)
             self.budget_spin.setValue(want)
@@ -1836,8 +1983,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         except Exception as exc:
             self._log(f"load failed: {exc}")
             return
-        for _ in sp.parse(sp.file_source(path), capture=self.cap):
-            pass
+        sp.StreamParser(self.cap, echo_events=False).feed(bytes(self.raw))
         self._log(f"{len(self.cap)} samples from {os.path.basename(path)}")
         if self.cap.config:
             self._on_config(self.cap.config)

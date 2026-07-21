@@ -5,6 +5,9 @@
 #include "lidar_parser.h"
 #include "protocol.h"   // SCAN_MODE_*, the command letters and their limits
 #include "stepper.h"
+#include <Adafruit_NeoPixel.h>
+
+#define STATUS_LED_PIN  16
 
 // The Scanner is the whole application: the motor, the lidar link and the USB
 // protocol, all on core0. There is no second core and no sensor fusion -- the
