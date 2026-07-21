@@ -1058,6 +1058,57 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.half_lbl.setStyleSheet("color: #b26a00;")
         f.addWidget(self.half_lbl, 10, 0, 1, 2)
 
+        # --- Microstep non-linearity ----------------------------------------
+        # The firmware reports the angle it commanded; the rotor sits a little
+        # off it, periodically with the full step. See scan_proto.py.
+        self.ustep_spin = QtWidgets.QDoubleSpinBox()
+        self.ustep_spin.setRange(0.0, 0.2)
+        self.ustep_spin.setDecimals(4)
+        self.ustep_spin.setSingleStep(0.0025)
+        self.ustep_spin.setValue(sp.MICROSTEP_ERROR_DEG)
+        self.ustep_spin.setSuffix(" deg")
+        self.ustep_spin.setToolTip(
+            "How far the rotor sits from the microstep the firmware asked "
+            "for.\n"
+            "The driver divides each 1.8 deg full step into 16, but the motor "
+            "is pulled toward the nearest detent, so those 16 bunch up instead "
+            "of dividing it evenly. The sample is then placed at the commanded "
+            "azimuth rather than the true one, which slides it sideways along "
+            "a wall -- so a flat wall arrives with ripples one full step "
+            "apart, faint where the wall faces the sensor and growing toward "
+            "its ends. At 3 m along a wall, one microstep of error is a 6 mm "
+            "bump.\n"
+            "0 disables the correction. Try 0.011 to 0.056 (a tenth to half a "
+            "microstep) and wind it up until the ripple flattens. Set the "
+            "phase below first -- amplitude alone does nothing at the wrong "
+            "phase.\n"
+            "Unlike the emitter spacing this knob can invent structure: "
+            "bending the azimuth at the full-step period will always find "
+            "something to flatten in a noisy cloud. Tune it on one long clean "
+            "wall, then confirm the same numbers still help on a different "
+            "scan before trusting them.")
+        self.ustep_spin.valueChanged.connect(self._rebuild)
+        f.addWidget(QtWidgets.QLabel("Microstep error"), 11, 0)
+        f.addWidget(self.ustep_spin, 11, 1)
+
+        self.ustep_phase_spin = QtWidgets.QDoubleSpinBox()
+        self.ustep_phase_spin.setRange(0.0, 360.0)
+        self.ustep_phase_spin.setDecimals(0)
+        self.ustep_phase_spin.setSingleStep(15.0)
+        self.ustep_phase_spin.setWrapping(True)
+        self.ustep_phase_spin.setValue(sp.MICROSTEP_ERROR_PHASE)
+        self.ustep_phase_spin.setSuffix(" deg")
+        self.ustep_phase_spin.setToolTip(
+            "Where within the full step the correction above is applied. "
+            "360 here is one 1.8 deg full step, so 90 slides it by four "
+            "microsteps.\n"
+            "Sweep this at a fixed amplitude until the ripple is at its "
+            "weakest, then trim the amplitude. At the wrong phase a larger "
+            "amplitude makes the wall worse, not better.")
+        self.ustep_phase_spin.valueChanged.connect(self._rebuild)
+        f.addWidget(QtWidgets.QLabel("Microstep phase"), 12, 0)
+        f.addWidget(self.ustep_phase_spin, 12, 1)
+
         self.cam_box = QtWidgets.QComboBox()
         self.cam_box.addItem("Orbit (Blender)", CAM_ORBIT)
         self.cam_box.addItem("Fly / FPS (Unity)", CAM_FPS)
@@ -1073,12 +1124,12 @@ class ScannerUI(QtWidgets.QMainWindow):
             "whenever the pointer is over the 3D view. Best for getting "
             "inside a scanned room.")
         self.cam_box.currentIndexChanged.connect(self._on_cam_mode_changed)
-        f.addWidget(QtWidgets.QLabel("Camera"), 11, 0)
-        f.addWidget(self.cam_box, 11, 1)
+        f.addWidget(QtWidgets.QLabel("Camera"), 13, 0)
+        f.addWidget(self.cam_box, 13, 1)
 
         b = QtWidgets.QPushButton("Reset camera")
         b.clicked.connect(self._frame_cloud)
-        f.addWidget(b, 12, 0, 1, 2)
+        f.addWidget(b, 14, 0, 1, 2)
         return g
 
     def _on_cam_mode_changed(self):
@@ -1304,6 +1355,8 @@ class ScannerUI(QtWidgets.QMainWindow):
             "geom/emitter_spacing": self.spacing_spin,
             "geom/scan_half": self.half_box,
             "geom/flip_upright": self.flip_chk,
+            "geom/microstep_error": self.ustep_spin,
+            "geom/microstep_phase": self.ustep_phase_spin,
         }
         self._restore_settings()
 
@@ -1672,7 +1725,9 @@ class ScannerUI(QtWidgets.QMainWindow):
                 lidar_reverse=self.reverse_chk.isChecked(),
                 flip_upright=self.flip_chk.isChecked(),
                 emitter_spacing=self.spacing_spin.value(),
-                half=self.half_box.currentData())
+                half=self.half_box.currentData(),
+                microstep_error=self.ustep_spin.value(),
+                microstep_phase=self.ustep_phase_spin.value())
         except SystemExit:
             return  # no sweep data yet
         if self.voxel_spin.value():
@@ -1892,7 +1947,9 @@ class ScannerUI(QtWidgets.QMainWindow):
                 lidar_reverse=self.reverse_chk.isChecked(),
                 flip_upright=self.flip_chk.isChecked(),
                 emitter_spacing=self.spacing_spin.value(),
-                half=self.half_box.currentData())
+                half=self.half_box.currentData(),
+                microstep_error=self.ustep_spin.value(),
+                microstep_phase=self.ustep_phase_spin.value())
         except SystemExit:
             self._log("failed to build cloud for saving")
             return

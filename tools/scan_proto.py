@@ -132,6 +132,63 @@ SCAN_HALF_NAMES = {
 # The shaft turns about world Z: this is a plain yaw, and nothing else.
 SPIN_AXIS = (0.0, 0.0, 1.0)
 
+# --- Microstep non-linearity ------------------------------------------------
+#
+# The firmware counts microsteps and reports the angle it *commanded*; the rotor
+# goes where the A4988's two coil currents actually put it, which is not quite
+# the same place. On a hybrid stepper the two disagree periodically, and the
+# period is the full step -- the rotor is pulled toward the nearest detent, so
+# the 16 microsteps inside a full step bunch up rather than dividing it evenly.
+# It is a property of the motor and the driver, not of the load, and it does not
+# average out over a sweep: every full step is wrong the same way.
+#
+# What it does to the cloud: the sample is placed at the commanded azimuth
+# instead of the true one, so it is misplaced *tangentially*, by delta * r. On a
+# flat wall the part of that which shows is the component along the wall normal,
+#
+#     bump = delta * g,   g = n . (zhat x P)
+#
+# and g is the along-wall distance from the point where the wall comes closest
+# to the rotation axis. So the error vanishes where the wall faces the sensor
+# head-on and grows as the wall runs away to either side -- which is why it
+# reads as ripples that get stronger toward the ends of a long wall, spaced one
+# full step apart. At 1 m along the wall a one-microstep error is a 2 mm bump;
+# at 3 m it is 6 mm.
+#
+# The correction is a single sinusoid on the commanded angle. Both numbers have
+# to be dialled in against a flat wall, the same way EMITTER_SPACING_MM is,
+# because they belong to one specific motor:
+#
+#   * MICROSTEP_ERROR_DEG is the amplitude, in degrees of shaft angle. Zero
+#     disables the whole correction. A tenth to a half of a microstep (0.011 to
+#     0.056) is the range worth trying; wind it up until the ripple flattens.
+#   * MICROSTEP_ERROR_PHASE slides the correction within the full step, in
+#     degrees of the 1.8 deg cycle (so 360 here is one full step). The amplitude
+#     alone will not flatten anything at the wrong phase, and the two interact:
+#     sweep the phase at a fixed amplitude, then trim the amplitude.
+#
+# A warning about tuning this by eye: unlike the emitter spacing, this knob can
+# manufacture structure that was not there. Bending the azimuth at the full-step
+# period will always find *something* to flatten in a noisy cloud. Set it on a
+# scan with one long clean wall, then check the numbers still help on a second
+# scan of somewhere else before believing them.
+MICROSTEP_ERROR_DEG = 0.0
+MICROSTEP_ERROR_PHASE = 0.0
+
+# Degrees of shaft per full step: 1.8 for a 200-step motor. The microstep
+# resolution does not enter -- the error repeats with the full step regardless
+# of how finely it is divided.
+FULL_STEP_DEG = 1.8
+
+
+def correct_microstep(platform_deg, amp=MICROSTEP_ERROR_DEG,
+                      phase=MICROSTEP_ERROR_PHASE):
+    """Commanded shaft angle -> best estimate of the true one."""
+    if not amp:
+        return platform_deg
+    th = np.asarray(platform_deg, dtype=np.float64)
+    return th + amp * np.sin(np.radians(360.0 * th / FULL_STEP_DEG + phase))
+
 # Rotation of the lidar about its own spin axis, in degrees clockwise (the same
 # sense the azimuth below runs in).
 #
@@ -490,7 +547,9 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
                 beam_offset=BEAM_OFFSET_MM,
                 lidar_rotation=LIDAR_ROTATION_DEG,
                 lidar_reverse=LIDAR_REVERSE, flip_upright=FLIP_UPRIGHT,
-                emitter_spacing=EMITTER_SPACING_MM, half=SCAN_HALF_BOTH):
+                emitter_spacing=EMITTER_SPACING_MM, half=SCAN_HALF_BOTH,
+                microstep_error=MICROSTEP_ERROR_DEG,
+                microstep_phase=MICROSTEP_ERROR_PHASE):
     """Reconstruct the 3D point cloud.
 
     Returns (xyz, dist, platform_deg). Each sample carries the shaft angle it
@@ -563,10 +622,15 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
                   np.full_like(d, beam_offset),
                   d * cos_th - b * sin_th], axis=-1)
 
-    # Yaw about world Z by the shaft angle. No transpose ambiguity, no drift,
-    # no offset to solve for: this is the commanded angle of a sensor rigidly
-    # bolted to the shaft that produced it.
-    R = axis_angle_matrix(SPIN_AXIS, col["platform"][k])
+    # Yaw about world Z by the shaft angle. No transpose ambiguity and no drift:
+    # this is the angle of a sensor rigidly bolted to the shaft that produced it.
+    # The one thing it is not is exact -- it is the angle the firmware
+    # *commanded*, and the rotor sits a little off it, periodically with the full
+    # step. See MICROSTEP_ERROR_DEG; with the amplitude at zero this is the
+    # commanded angle unchanged.
+    platform = correct_microstep(col["platform"][k], microstep_error,
+                                 microstep_phase)
+    R = axis_angle_matrix(SPIN_AXIS, platform)
     world = np.einsum("nij,nkj->nki", R, p)
 
     # 180 deg about world X, after the pose. See FLIP_UPRIGHT.
@@ -577,7 +641,7 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
     g = good.ravel()
     return (world.reshape(-1, 3)[g],
             d.ravel()[g],
-            np.repeat(col["platform"][k], POINTS)[g])
+            np.repeat(platform, POINTS)[g])
 
 
 def _sweep_mask(cap, col):
