@@ -113,7 +113,7 @@ static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
 #define SCAN_DEGREES_MIN 1.0f
 #define SCAN_DEGREES_MAX 180.0f
 #define SCAN_TIME_MIN    2.0f
-#define SCAN_TIME_MAX    600.0f
+#define SCAN_TIME_MAX    6000.0f
 #define SCAN_STEPS_MIN   2
 #define SCAN_STEPS_MAX   2000
 #define SCAN_DWELL_MIN   50

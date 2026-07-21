@@ -15,6 +15,7 @@ Optional: pymeshlab, for Poisson and ball-pivoting surface reconstruction
 (open3d is used instead if that is what the machine has).
 """
 
+import json
 import os
 import queue
 import sys
@@ -31,6 +32,86 @@ import cloud_io
 import meshing
 
 BAUD = 115200
+
+# Panel state lives next to the source and travels with the repo, so the mount
+# geometry dialled in on one machine is the geometry every checkout starts with.
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "ui_settings.json")
+
+
+class FileSettings:
+    """QSettings-shaped store backed by one JSON file.
+
+    Same value()/setValue() surface QSettings had, so the panel code did not
+    have to change, but the file is versioned instead of living in the
+    registry (Windows) or ~/.config (Linux) where it could not be shared.
+    Values keep their JSON types, so the string round-tripping QSettings forced
+    on bools no longer happens -- the readers still tolerate it for old files.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._data = {}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            # Missing or hand-broken: start empty rather than refuse to launch.
+            # Defaults stand, and the next save rewrites the file.
+            return
+        if isinstance(data, dict):
+            self._data = {k: v for k, v in data.items() if isinstance(k, str)}
+
+    def value(self, key, default=None):
+        return self._data.get(key, default)
+
+    def setValue(self, key, val):
+        self._data[key] = val
+
+    def allKeys(self):
+        return list(self._data)
+
+    def sync(self):
+        """Write the file. Atomic, so a crash mid-save cannot truncate it."""
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._data, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            os.replace(tmp, self.path)
+        except OSError:
+            pass  # a read-only checkout should not take the session down
+
+    def migrate_from_qsettings(self, qs):
+        """One-time import of the pre-file location. No-op once the file exists.
+
+        Without this the switch to a versioned file would silently reset every
+        panel value, geometry included, which is exactly the failure the
+        settings exist to prevent.
+        """
+        if self._data:
+            return False
+        for key in qs.allKeys():
+            val = qs.value(key)
+            if isinstance(val, str):
+                # QSettings handed bools and numbers back as strings on some
+                # backends; recover the real types on the way in.
+                low = val.strip().lower()
+                if low in ("true", "false"):
+                    val = low == "true"
+                else:
+                    try:
+                        val = int(val)
+                    except ValueError:
+                        try:
+                            val = float(val)
+                        except ValueError:
+                            pass
+            self._data[key] = val
+        return bool(self._data)
 
 
 def _enum(owner, *paths):
@@ -832,7 +913,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         f.addWidget(self.angle_spin, 0, 1)
 
         self.time_spin = QtWidgets.QDoubleSpinBox()
-        self.time_spin.setRange(2.0, 600.0)
+        self.time_spin.setRange(1.0, 6000.0)
         self.time_spin.setValue(30.0)
         self.time_spin.setSuffix(" s")
         f.addWidget(QtWidgets.QLabel("Duration"), 1, 0)
@@ -1323,7 +1404,10 @@ class ScannerUI(QtWidgets.QMainWindow):
     # week's guess. The capture settings ride along for convenience.
 
     def _init_settings(self):
-        self.settings = QtCore.QSettings("LidarScanner", "scanner_ui")
+        self.settings = FileSettings(SETTINGS_PATH)
+        if self.settings.migrate_from_qsettings(
+                QtCore.QSettings("LidarScanner", "scanner_ui")):
+            self.settings.sync()
 
         # key -> widget. Keys are stable strings, deliberately not derived from
         # the attribute names, so a later rename cannot quietly orphan a saved
@@ -1428,6 +1512,7 @@ class ScannerUI(QtWidgets.QMainWindow):
                                self.budget_spin.value())
         for key, sec in self.sections.items():
             self.settings.setValue(f"fold/{key}", sec.is_expanded())
+        self.settings.sync()
 
     # --- device -------------------------------------------------------------
 
