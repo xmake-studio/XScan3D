@@ -169,14 +169,84 @@ STRONG_FOCUS = _enum(QtCore.Qt, "FocusPolicy.StrongFocus", "StrongFocus")
 LEFT_BUTTON = _enum(QtCore.Qt, "MouseButton.LeftButton", "LeftButton")
 MIDDLE_BUTTON = _enum(QtCore.Qt, "MouseButton.MiddleButton", "MiddleButton")
 SHIFT_MOD = _enum(QtCore.Qt, "KeyboardModifier.ShiftModifier", "ShiftModifier")
+CTRL_MOD = _enum(QtCore.Qt, "KeyboardModifier.ControlModifier",
+                 "ControlModifier")
+ALT_MOD = _enum(QtCore.Qt, "KeyboardModifier.AltModifier", "AltModifier")
+TRANSPARENT_FOR_MOUSE = _enum(
+    QtCore.Qt, "WidgetAttribute.WA_TransparentForMouseEvents",
+    "WA_TransparentForMouseEvents")
 EV_KEY_PRESS = _enum(QtCore.QEvent, "Type.KeyPress", "KeyPress")
 EV_KEY_RELEASE = _enum(QtCore.QEvent, "Type.KeyRelease", "KeyRelease")
+EV_WHEEL = _enum(QtCore.QEvent, "Type.Wheel", "Wheel")
+EV_NATIVE_GESTURE = _enum(QtCore.QEvent, "Type.NativeGesture", "NativeGesture")
 EV_WINDOW_DEACTIVATE = _enum(QtCore.QEvent, "Type.WindowDeactivate",
                              "WindowDeactivate")
+# Pinch, as Windows precision touchpads and macOS trackpads report it. Older
+# bindings predate the member, hence the tolerant lookup.
+try:
+    ZOOM_GESTURE = _enum(QtCore.Qt, "NativeGestureType.ZoomNativeGesture",
+                         "ZoomNativeGesture")
+except AttributeError:  # pragma: no cover - binding without native gestures
+    ZOOM_GESTURE = None
 
 
 def _key(name):
     return _enum(QtCore.Qt, f"Key.Key_{name}", f"Key_{name}")
+
+
+# --- Scroll-safe value widgets ----------------------------------------------
+
+class _NoWheelEdits(QtCore.QObject):
+    """Stops the wheel from editing the widget it happens to be hovering.
+
+    Qt's default is that a spin box, slider or combo under the pointer eats the
+    wheel and changes its value. In a panel this tall that is a trap: scrolling
+    down to the meshing controls drags the pointer across half a dozen editable
+    widgets, and any of them silently absorbing a notch retunes a scan
+    parameter -- a change that shows up later as a worse cloud with no obvious
+    cause. Keyboard, arrows and typing still edit; the wheel simply stops being
+    an editing gesture.
+
+    The event is not merely swallowed, because that would make the panel refuse
+    to scroll wherever a control lies under the pointer -- which is most of it.
+    It is forwarded to the enclosing scroll area instead, so the wheel always
+    means the one thing it should mean here: scroll the panel.
+    """
+
+    def eventFilter(self, obj, ev):
+        if ev.type() != EV_WHEEL:
+            return False
+        area = obj.parent()
+        while area is not None and not isinstance(area, QtWidgets.QAbstractScrollArea):
+            area = area.parent()
+        if area is not None:
+            QtWidgets.QApplication.sendEvent(area.viewport(), ev)
+        return True
+
+
+#: One filter instance serves every widget; QObject parenting keeps it alive.
+_NO_WHEEL = None
+
+#: Wheel-editable widget types, all of which sit in the scrolling side panel.
+_VALUE_WIDGETS = (QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox,
+                  QtWidgets.QSlider)
+
+
+def _disable_wheel_edits(root):
+    """Apply _NoWheelEdits to every value widget under `root`.
+
+    Done in one sweep after the panel is built rather than at each widget's
+    construction, so a control added later cannot forget to opt in.
+    """
+    global _NO_WHEEL
+    if _NO_WHEEL is None:
+        _NO_WHEEL = _NoWheelEdits()
+    for cls in _VALUE_WIDGETS:
+        for w in root.findChildren(cls):
+            w.installEventFilter(_NO_WHEEL)
+            # Otherwise the widget takes focus from a passing wheel or click
+            # and then steals the arrow keys as well.
+            w.setFocusPolicy(STRONG_FOCUS)
 
 
 # --- Collapsible section ----------------------------------------------------
@@ -485,26 +555,62 @@ class SceneView(gl.GLViewWidget):
     # is effectively the head, large enough to stay clear of the near plane.
     FPS_DISTANCE = 100.0
 
-    # Direction per key group as (forward, right, up) coefficients in the
-    # camera's frame. One table, so the keys the event filter claims cannot
-    # drift out of step with the keys walking actually honours.
-    MOVE_KEYS = {
-        ("W", "Up"): (1, 0, 0),
-        ("S", "Down"): (-1, 0, 0),
-        ("D", "Right"): (0, 1, 0),
-        ("A", "Left"): (0, -1, 0),
-        ("E", "Space"): (0, 0, 1),
-        ("Q", "Control"): (0, 0, -1),
+    # Direction per action as (forward, right, up) coefficients in the camera's
+    # frame. Keys map to actions, actions map to motion: the two tables meet at
+    # a name, so the keys the event filter claims cannot drift out of step with
+    # the keys walking actually honours.
+    MOVES = {
+        "fwd": (1, 0, 0),
+        "back": (-1, 0, 0),
+        "right": (0, 1, 0),
+        "left": (0, -1, 0),
+        "rise": (0, 0, 1),
+        "sink": (0, 0, -1),
+    }
+
+    # Keys whose meaning the keyboard layout cannot change: arrows and
+    # modifiers sit outside the alphabetic block, so Qt reports the same
+    # Key_ value for them whatever language is selected.
+    LAYOUT_SAFE_KEYS = {
+        "Up": "fwd", "Down": "back", "Right": "right", "Left": "left",
+        "Space": "rise", "Control": "sink", "Shift": "fast",
+    }
+
+    # WASDQE by *position on the keyboard*, which is the only thing about them
+    # that is stable. On a Cyrillic (or Greek, or Hebrew) layout the physical W
+    # key delivers Key_Tse, not Key_W, so a table keyed on ev.key() stops
+    # matching the moment the layout is switched -- and the camera turns but
+    # refuses to walk, since the arrows kept working. That is the whole of the
+    # intermittent "flying is broken" bug: it depended on the input language,
+    # not on focus, so it could start broken or break mid-session at Alt+Shift.
+    # Scan codes are the hardware's own numbering and are untouched by layout.
+    SCAN_ACTIONS = {
+        "win32": {0x11: "fwd", 0x1F: "back", 0x20: "right", 0x1E: "left",
+                  0x12: "rise", 0x10: "sink"},
+        "darwin": {13: "fwd", 1: "back", 2: "right", 0: "left",
+                   14: "rise", 12: "sink"},
+        # X11/Wayland report evdev codes offset by 8.
+        "linux": {25: "fwd", 39: "back", 40: "right", 38: "left",
+                  26: "rise", 24: "sink"},
     }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.FLY_KEYS = frozenset(
-            [_key("Shift")]
-            + [_key(n) for group in self.MOVE_KEYS for n in group])
+        self._scan_actions = self.SCAN_ACTIONS.get(
+            "linux" if sys.platform.startswith("linux") else sys.platform, {})
+        # The Latin names stay in play as a fallback, for a platform whose scan
+        # codes we do not know and for anyone on a plain US layout.
+        self._key_actions = {
+            _key(n): a for n, a in dict(
+                self.LAYOUT_SAFE_KEYS,
+                W="fwd", S="back", D="right", A="left", E="rise", Q="sink",
+            ).items()
+        }
         self.cam_mode = CAM_ORBIT
         self._orbit_distance = None   # remembered across a trip into FPS
         self._held = set()
+        self._toast = None            # built on first use, see _flash
+        self._toast_timer = None
         self.speed = 1500.0           # mm/s at a walk
         self.setFocusPolicy(STRONG_FOCUS)
         self._tick = QtCore.QTimer(self)
@@ -530,6 +636,8 @@ class SceneView(gl.GLViewWidget):
             self._tick.stop()
             QtWidgets.QApplication.instance().removeEventFilter(self)
             self._held.clear()
+            if self._toast is not None:
+                self._toast.hide()
             # Pull the centre back out to a sane orbit radius along the
             # current view direction, so the scene stays in front of you.
             eye = _vec3(self.cameraPosition())
@@ -595,16 +703,22 @@ class SceneView(gl.GLViewWidget):
 
         relative='view' instead pans in the plane of the screen, so a vertical
         drag carries the pivot up and down through the scene exactly as
-        shift-drag does in Blender. Shift+left is bound to the same thing for
-        mice with no usable middle button.
+        shift-drag does in Blender. Shift+left and Alt+left are bound to the
+        same thing for laptops, where there is no middle button to hold: a
+        touchpad can only report left and right, so the Blender pivot-slide is
+        otherwise simply unreachable. Alt+left is the pairing Blender itself
+        offers under "emulate 3 button mouse", so the muscle memory carries.
         """
         pos = ev.position() if hasattr(ev, "position") else ev.localPos()
         if getattr(self, "mousePos", None) is None:
             self.mousePos = pos
         diff = pos - self.mousePos
-        buttons = ev.buttons()
-        panning = (buttons == MIDDLE_BUTTON
-                   or (buttons == LEFT_BUTTON and ev.modifiers() & SHIFT_MOD))
+        mods = ev.modifiers()
+        # `&` rather than `==` on the buttons: a touchpad tap-drag can report a
+        # stray second button, and a strict compare would drop the whole drag.
+        panning = (ev.buttons() & MIDDLE_BUTTON
+                   or (ev.buttons() & LEFT_BUTTON
+                       and mods & (SHIFT_MOD | ALT_MOD)))
         if not panning:
             return super().mouseMoveEvent(ev)
         self.mousePos = pos
@@ -631,14 +745,112 @@ class SceneView(gl.GLViewWidget):
         self._place(eye)
         self.update()
 
+    @staticmethod
+    def _scroll_steps(ev):
+        """Scroll amount as (horizontal, vertical) in wheel notches.
+
+        A mouse wheel arrives in whole 120-unit detents, so one notch is one
+        unit here and the feel is unchanged. A precision touchpad instead
+        streams many small deltas and fills in pixelDelta, which is the finer
+        and more honest measure of how far the fingers actually moved -- using
+        it is what makes two-finger scrolling glide rather than jump in wheel
+        detents. 120px of finger travel is called one notch so that both
+        devices cover comparable ground.
+
+        Stock pyqtgraph reads angleDelta().x() first and only falls back to y,
+        which on a touchpad means an unavoidably imperfect horizontal component
+        of a vertical swipe hijacks the zoom. The two axes are kept separate
+        here and given separate jobs.
+        """
+        if not hasattr(ev, "angleDelta"):       # very old bindings
+            return 0.0, ev.delta() / 120.0
+        pixels = ev.pixelDelta() if hasattr(ev, "pixelDelta") else None
+        if pixels is not None and (pixels.x() or pixels.y()):
+            return pixels.x() / 120.0, pixels.y() / 120.0
+        angle = ev.angleDelta()
+        return angle.x() / 120.0, angle.y() / 120.0
+
+    def _set_speed(self, value):
+        """Retune the walk, and say so briefly on the view.
+
+        Speed has no control of its own and no readout, so before this a notch
+        of wheel changed how fast you fly with nothing to show for it -- you
+        found out by walking. Unity answers the same gesture with a number that
+        fades, which is enough to aim at a speed instead of feeling for it.
+        """
+        self.speed = float(np.clip(value, 50.0, 50000.0))
+        self._flash(f"Fly speed  {self.speed / 1000.0:.2f} m/s")
+
+    def _flash(self, text, ms=900):
+        """Show `text` over the view, then let it disappear."""
+        if self._toast is None:
+            self._toast = QtWidgets.QLabel(self)
+            self._toast.setStyleSheet(
+                "background: rgba(0, 0, 0, 160); color: white;"
+                "padding: 6px 10px; border-radius: 4px;")
+            # Clicks belong to the camera; the label is a readout, not a
+            # target, and must not swallow a drag that starts under it.
+            self._toast.setAttribute(TRANSPARENT_FOR_MOUSE, True)
+            self._toast_timer = QtCore.QTimer(self)
+            self._toast_timer.setSingleShot(True)
+            self._toast_timer.timeout.connect(self._toast.hide)
+        self._toast.setText(text)
+        self._toast.adjustSize()
+        self._toast.move((self.width() - self._toast.width()) // 2,
+                         self.height() - self._toast.height() - 24)
+        self._toast.show()
+        self._toast_timer.start(ms)   # restart: each notch buys another moment
+
+    def _zoom(self, steps):
+        """Pull the camera in or out by `steps` wheel notches."""
+        # Matches pyqtgraph's 0.999**delta on a 120-unit detent exactly, so a
+        # mouse wheel feels the way it always did.
+        self.opts["distance"] *= 0.999 ** (steps * 120.0)
+        self.update()
+
     def wheelEvent(self, ev):
-        if self.cam_mode != CAM_FPS:
-            return super().wheelEvent(ev)
-        # Zooming has no meaning without an orbit radius; spend the wheel on
-        # how fast you walk instead, which is the thing you actually retune.
-        delta = ev.angleDelta().y() if hasattr(ev, "angleDelta") else ev.delta()
-        self.speed = float(np.clip(self.speed * 1.15 ** (delta / 120.0),
-                                   50.0, 50000.0))
+        dx, dy = self._scroll_steps(ev)
+        if self.cam_mode == CAM_FPS:
+            # Zooming has no meaning without an orbit radius; spend the wheel
+            # on how fast you walk instead, which is what you actually retune.
+            self._set_speed(self.speed * 1.15 ** dy)
+            ev.accept()
+            return
+        if ev.modifiers() & SHIFT_MOD:
+            # Shift turns the whole gesture into a two-axis pan: the way to
+            # slide the pivot with no buttons held at all, which is the state a
+            # touchpad is in whenever it is not being pressed.
+            self.pan(dx * 40.0, dy * 40.0, 0, relative="view")
+        else:
+            # Vertical scroll zooms, as the wheel always has -- and ctrl+scroll
+            # is what a non-precision touchpad sends for a pinch, so it lands
+            # here too. Horizontal scroll has no wheel tradition to honour and
+            # is free to do what a touchpad makes easy and a mouse cannot:
+            # slide the pivot sideways.
+            if dy:
+                self._zoom(dy)
+            if dx:
+                self.pan(dx * 40.0, 0, 0, relative="view")
+        ev.accept()
+
+    def event(self, ev):
+        """Pinch-to-zoom, which arrives outside the wheel path.
+
+        Windows precision touchpads and macOS trackpads report a pinch as a
+        native gesture rather than as ctrl+wheel, and Qt has no virtual handler
+        for those -- unhandled, the most natural zoom gesture a laptop has does
+        nothing at all.
+        """
+        if ev.type() == EV_NATIVE_GESTURE and ZOOM_GESTURE is not None:
+            if ev.gestureType() == ZOOM_GESTURE:
+                # value() is the fractional scale change for this step.
+                if self.cam_mode == CAM_FPS:
+                    self._set_speed(self.speed * (1.0 + ev.value()))
+                else:
+                    self.opts["distance"] *= max(0.1, 1.0 - ev.value())
+                    self.update()
+                return True
+        return super().event(ev)
 
     # --- walking ------------------------------------------------------------
 
@@ -668,14 +880,29 @@ class SceneView(gl.GLViewWidget):
             return False
         if not (self._pointer_over_view() or self.hasFocus()):
             return False
-        if ev.key() not in self.FLY_KEYS:
+        action = self._action(ev)
+        if action is None:
             return False
         if not ev.isAutoRepeat():
             if t == EV_KEY_PRESS:
-                self._held.add(ev.key())
+                self._held.add(action)
             else:
-                self._held.discard(ev.key())
+                self._held.discard(action)
         return True
+
+    def _action(self, ev):
+        """What this keystroke means, by position first and letter second.
+
+        Position wins because it is what the finger actually did: the scan code
+        of the key under the left middle finger is the same number whether the
+        layout calls it W or Ц. ev.key() is consulted only as a fallback, which
+        keeps the arrows and modifiers working (they have no scan code entry)
+        and keeps some unknown platform's letters working too.
+        """
+        action = self._scan_actions.get(ev.nativeScanCode())
+        if action is not None:
+            return action
+        return self._key_actions.get(ev.key())
 
     def _pointer_over_view(self):
         if not self.isVisible():
@@ -704,8 +931,8 @@ class SceneView(gl.GLViewWidget):
         right = right / n if n > 1e-6 else np.array([1.0, 0.0, 0.0])
 
         move = np.zeros(3)
-        for names, (f, r, u) in self.MOVE_KEYS.items():
-            if any(_key(k) in self._held for k in names):
+        for action, (f, r, u) in self.MOVES.items():
+            if action in self._held:
                 move += f * fwd + r * right + u * up
         if not move.any():
             return
@@ -714,7 +941,7 @@ class SceneView(gl.GLViewWidget):
         # last event Qt delivered, and this timer fires with no events in
         # between, so it lagged a keystroke behind -- the boost arrived on
         # release rather than on press.
-        fast = 4.0 if _key("Shift") in self._held else 1.0
+        fast = 4.0 if "fast" in self._held else 1.0
         step = move / np.linalg.norm(move) * self.speed * fast * dt
         self.opts["center"] = pg.Vector(*(_vec3(self.opts["center"]) + step))
         self.update()
@@ -879,6 +1106,9 @@ class ScannerUI(QtWidgets.QMainWindow):
             side.addWidget(sec)
         # _on_view_mode_changed shows and hides this wholesale, header and all.
         self.geom_group = self.sections["geometry"]
+
+        # After every group exists, so no control can be missed.
+        _disable_wheel_edits(panel)
 
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -1384,11 +1614,13 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.cam_box.addItem("Orbit (Blender)", CAM_ORBIT)
         self.cam_box.addItem("Fly / FPS (Unity)", CAM_FPS)
         self.cam_box.setToolTip(
-            "Orbit: drag swings the camera around a fixed point, wheel zooms "
-            "in and out of it. Middle-drag (or Shift+drag) slides that point "
-            "through the scene, sideways and up and down, as in Blender -- "
-            "use it to bring the floor into reach. Best for turning one "
-            "object over.\n"
+            "Orbit: drag swings the camera around a fixed point, wheel or "
+            "two-finger scroll zooms in and out of it, pinch does too. "
+            "Middle-drag slides that point through the scene, sideways and up "
+            "and down, as in Blender -- use it to bring the floor into reach. "
+            "On a laptop touchpad, Shift+drag or Alt+drag slides it instead, "
+            "and so does a two-finger scroll with Shift held. Best for turning "
+            "one object over.\n"
             "Fly: drag looks around from where you stand, WASD walks, "
             "E / Space up and Q / Ctrl down, Shift for four times the speed, "
             "and the wheel sets that speed rather than zooming. The keys work "
