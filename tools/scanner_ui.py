@@ -747,7 +747,12 @@ class SceneView(gl.GLViewWidget):
 
     @staticmethod
     def _scroll_steps(ev):
-        """Scroll amount as (horizontal, vertical) in wheel notches.
+        """Scroll amount as (horizontal, vertical, precise) in wheel notches.
+
+        `precise` says the deltas came from pixelDelta, i.e. from fingers on a
+        precision touchpad rather than from a wheel's detents. The two devices
+        want different jobs from the same event, so the caller has to be able to
+        tell them apart.
 
         A mouse wheel arrives in whole 120-unit detents, so one notch is one
         unit here and the feel is unchanged. A precision touchpad instead
@@ -763,12 +768,12 @@ class SceneView(gl.GLViewWidget):
         here and given separate jobs.
         """
         if not hasattr(ev, "angleDelta"):       # very old bindings
-            return 0.0, ev.delta() / 120.0
+            return 0.0, ev.delta() / 120.0, False
         pixels = ev.pixelDelta() if hasattr(ev, "pixelDelta") else None
         if pixels is not None and (pixels.x() or pixels.y()):
-            return pixels.x() / 120.0, pixels.y() / 120.0
+            return pixels.x() / 120.0, pixels.y() / 120.0, True
         angle = ev.angleDelta()
-        return angle.x() / 120.0, angle.y() / 120.0
+        return angle.x() / 120.0, angle.y() / 120.0, False
 
     def _set_speed(self, value):
         """Retune the walk, and say so briefly on the view.
@@ -809,7 +814,7 @@ class SceneView(gl.GLViewWidget):
         self.update()
 
     def wheelEvent(self, ev):
-        dx, dy = self._scroll_steps(ev)
+        dx, dy, precise = self._scroll_steps(ev)
         if self.cam_mode == CAM_FPS:
             # Zooming has no meaning without an orbit radius; spend the wheel
             # on how fast you walk instead, which is what you actually retune.
@@ -821,15 +826,22 @@ class SceneView(gl.GLViewWidget):
             # slide the pivot with no buttons held at all, which is the state a
             # touchpad is in whenever it is not being pressed.
             self.pan(dx * 40.0, dy * 40.0, 0, relative="view")
+        elif precise and not ev.modifiers() & CTRL_MOD:
+            # A bare two-finger swipe orbits, as it does in Blender. It used to
+            # zoom, which made it a second, clumsier pinch and left the gesture
+            # a touchpad reaches for most doing the job the pinch already does
+            # better -- while orbiting, the thing you actually want, needed a
+            # button held down. Pixels are read as if the fingers were dragging,
+            # so a swipe turns the view by as much as a drag of the same length.
+            self.orbit(-dx * 120.0, dy * 120.0)
         else:
-            # Vertical scroll zooms, as the wheel always has -- and ctrl+scroll
-            # is what a non-precision touchpad sends for a pinch, so it lands
-            # here too. Horizontal scroll has no wheel tradition to honour and
-            # is free to do what a touchpad makes easy and a mouse cannot:
-            # slide the pivot sideways.
+            # A wheel zooms, as it always has, and so does ctrl+scroll -- both
+            # what a non-precision touchpad sends for a pinch and Blender's
+            # touchpad zoom. Horizontal wheel scroll has no tradition to honour
+            # and is free to do what a mouse otherwise cannot: slide the pivot.
             if dy:
                 self._zoom(dy)
-            if dx:
+            if dx and not precise:
                 self.pan(dx * 40.0, 0, 0, relative="view")
         ev.accept()
 
@@ -1614,8 +1626,9 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.cam_box.addItem("Orbit (Blender)", CAM_ORBIT)
         self.cam_box.addItem("Fly / FPS (Unity)", CAM_FPS)
         self.cam_box.setToolTip(
-            "Orbit: drag swings the camera around a fixed point, wheel or "
-            "two-finger scroll zooms in and out of it, pinch does too. "
+            "Orbit: drag swings the camera around a fixed point, and so does "
+            "two-finger scroll. The wheel, pinch and ctrl+scroll zoom in and "
+            "out of it. "
             "Middle-drag slides that point through the scene, sideways and up "
             "and down, as in Blender -- use it to bring the floor into reach. "
             "On a laptop touchpad, Shift+drag or Alt+drag slides it instead, "
