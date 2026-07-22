@@ -658,6 +658,35 @@ def _sweep_mask(cap, col):
     return np.isin(t["state"][order], CAPTURE_STATES)
 
 
+def keep_last_sweep(cap):
+    """Drop everything decoded before the most recent capture run.
+
+    A .bin is the whole session, and a session routinely holds more than one
+    sweep -- the live UI clears the decoded scene at the start of every scan,
+    so only the last one is ever on screen. Replaying the file has to do the
+    same, or the sweeps all land in one cloud on top of each other.
+
+    Returns the number of samples dropped.
+    """
+    if not cap.telem:
+        return 0
+    # The last non-capturing -> capturing transition in the telemetry is the
+    # start of the run that is still on screen at the end of the session.
+    start = None
+    was = False
+    for rec in cap.telem:
+        now = int(rec[TEL_STATE]) in CAPTURE_STATES
+        if now and not was:
+            start = rec[TEL_T_US]
+        was = now
+    if start is None:
+        return 0
+    n = len(cap.samples)
+    cap.samples[:] = [s for s in cap.samples if s[0] >= start]
+    cap.telem[:] = [t for t in cap.telem if t[TEL_T_US] >= start]
+    return n - len(cap.samples)
+
+
 def voxel_downsample(xyz, extra, size):
     """Keep one point per `size`-mm cube. Cheap way to drop the redundancy that
     piles up close to the sensor, where the angular sampling is densest."""

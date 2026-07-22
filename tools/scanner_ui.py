@@ -2125,8 +2125,20 @@ class ScannerUI(QtWidgets.QMainWindow):
         except Exception as exc:
             self._log(f"load failed: {exc}")
             return
-        sp.StreamParser(self.cap, echo_events=False).feed(bytes(self.raw))
-        self._log(f"{len(self.cap)} samples from {os.path.basename(path)}")
+        # sweep_only mirrors the live link: the device streams frames in every
+        # state, so without it the idle frames either side of the sweep get
+        # decoded into the cloud too -- which the live path never shows.
+        sp.StreamParser(self.cap, echo_events=False,
+                        sweep_only=True).feed(bytes(self.raw))
+        # And a file holds the *session*, which may be several sweeps: live,
+        # _start clears the scene each time, so only the last one is ever on
+        # screen. Without this the sweeps pile into one cloud, which is why a
+        # reloaded .bin looked like two scans mushed together while the .ply --
+        # written from the already-cleared scene -- came back fine.
+        dropped = sp.keep_last_sweep(self.cap)
+        self._log(f"{len(self.cap)} samples from {os.path.basename(path)}"
+                  + (f" ({dropped} from earlier sweeps ignored)"
+                     if dropped else ""))
         if self.cap.config:
             self._on_config(self.cap.config)
         self._rebuild()
