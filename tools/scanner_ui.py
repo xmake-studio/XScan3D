@@ -30,6 +30,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 import scan_proto as sp
 import cloud_io
 import meshing
+import registration as reg
 
 BAUD = 115200
 
@@ -37,6 +38,27 @@ BAUD = 115200
 # geometry dialled in on one machine is the geometry every checkout starts with.
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "ui_settings.json")
+
+# Scans belong to the project, not to whatever directory the UI happened to be
+# launched from, so both the save dialogs and the autosaves anchor here.
+SCANS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scans")
+
+
+def scan_path(name, sub=None):
+    """Absolute path for `name` under scans/ (or scans/<sub>/), dir created.
+
+    The directory is made on demand rather than at import: a checkout without
+    scans/ should still get one the first time something is written.
+    """
+    d = os.path.join(SCANS_DIR, sub) if sub else SCANS_DIR
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        # Unwritable location: fall back to the working directory so a save can
+        # still happen, rather than failing before the dialog even opens.
+        return os.path.abspath(name)
+    return os.path.join(d, name)
 
 
 class FileSettings:
@@ -731,6 +753,34 @@ class MeshWorker(QtCore.QThread):
         self.done.emit(verts, faces, info)
 
 
+class RegisterWorker(QtCore.QThread):
+    """Aligns a new scan onto the map off the GUI thread.
+
+    Registration is seconds of numpy on a big cloud. Run inline it freezes the
+    window, which on a tool that is also holding a serial link looks exactly
+    like the board has stopped talking.
+    """
+
+    done = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    note = QtCore.pyqtSignal(str)
+
+    def __init__(self, source, target, params, parent=None):
+        super().__init__(parent)
+        self.source = source
+        self.target = target
+        self.params = params
+
+    def run(self):
+        try:
+            result = reg.register(self.source, self.target,
+                                  progress=self.note.emit, **self.params)
+        except Exception as exc:                       # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+        self.done.emit(result)
+
+
 # --- Main window ------------------------------------------------------------
 
 class ScannerUI(QtWidgets.QMainWindow):
@@ -750,6 +800,18 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.cloud = None          # (xyz, dist) currently displayed
         self.loaded_rgb = None     # colours from a loaded .ply, if any
         self._built_n = 0          # sample count the displayed cloud was built from
+
+        # --- multi-scan map ---
+        # The scanner only ever sees the room from where it is standing. In
+        # multi-scan mode each sweep is kept as its own cloud plus the 4x4 that
+        # puts it in the first scan's frame, and the map is their union. Poses
+        # are kept rather than baked in so a bad alignment can be undone.
+        self.scans = []            # [{"xyz", "dist", "T", "label"}]
+        self.live = None           # (xyz, dist) of the sweep not yet added
+        self._map = None           # cached (xyz, dist) union of self.scans
+        self._reg_worker = None
+        self._pending = None       # {"result", "xyz", "dist"} awaiting a verdict
+        self._last_state = sp.STATE_IDLE
         self.mesh = None           # (verts, faces) currently displayed
         self._mesh_worker = None
         self._mesh_points = 0      # cloud size the mesh was built from
@@ -808,6 +870,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.sections = {}
         for key, group in (("device", self._device_group()),
                            ("scan", self._scan_group()),
+                           ("map", self._map_group()),
                            ("view", self._view_group()),
                            ("geometry", self._geometry_group()),
                            ("file", self._file_group())):
@@ -878,7 +941,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.record_chk = QtWidgets.QCheckBox("Record raw stream alongside scan")
         self.record_chk.setChecked(False)
         self.record_chk.setToolTip(
-            "Write a scan_*.bin in the working directory as the scan runs, "
+            "Write a scan_*.bin into scans/autosaves as the scan runs, "
             "without being asked.\n"
             "Off by default: the same bytes are kept in memory either way, so "
             "Save .bin can write them afterwards. Turn this on only if you "
@@ -951,7 +1014,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         f.addWidget(self.dwell_spin, 4, 1)
 
         self.est_lbl = QtWidgets.QLabel("")
-        self.est_lbl.setStyleSheet("color: #666;")
+        self.est_lbl.setStyleSheet("color: #9a9a9a;")
         f.addWidget(self.est_lbl, 5, 0, 1, 2)
         for w in (self.steps_spin, self.dwell_spin, self.angle_spin):
             w.valueChanged.connect(self._update_estimate)
@@ -987,6 +1050,133 @@ class ScannerUI(QtWidgets.QMainWindow):
         f.addWidget(self.state_lbl, 10, 0, 1, 2)
 
         self._on_mode_changed()
+        return g
+
+    def _map_group(self):
+        """Multi-scan: build one map out of several sweeps from different spots.
+
+        The scanner cannot see round a corner or through itself, so one sweep is
+        always partly a shadow. Scanning again from somewhere else fills the
+        shadow in, but the second cloud arrives in its own frame -- centred on
+        wherever the rig now stands, pointing wherever it now points. This panel
+        is the machinery that puts the two in the same frame.
+        """
+        g = QtWidgets.QGroupBox("Multi-scan map")
+        f = QtWidgets.QGridLayout(g)
+        row = 0
+
+        self.multi_chk = QtWidgets.QCheckBox("Merge scans into one map")
+        self.multi_chk.setToolTip(
+            "Off: every scan replaces the last, as before.\n"
+            "On: each finished scan is aligned onto what has already been "
+            "mapped and added to it, so you can scan, move the rig, and scan "
+            "again to fill in what the first pass could not see.\n"
+            "The scans have to overlap -- roughly a third of the new sweep "
+            "needs to land on ground the map already covers.")
+        self.multi_chk.stateChanged.connect(self._on_multi_changed)
+        f.addWidget(self.multi_chk, row, 0, 1, 2)
+        row += 1
+
+        self.auto_add_chk = QtWidgets.QCheckBox("Add each scan automatically")
+        self.auto_add_chk.setToolTip(
+            "Align and add as soon as a sweep finishes. Turn this off to look "
+            "at a scan before it goes into the map.")
+        self.auto_add_chk.setChecked(True)
+        f.addWidget(self.auto_add_chk, row, 0, 1, 2)
+        row += 1
+
+        # How much the operator is willing to tell the algorithm about how they
+        # moved the rig. A room is mostly flat walls, so a scan taken from a
+        # different spot can line up convincingly in more than one way; saying
+        # roughly which way the rig was turned removes the ambiguity outright.
+        self.align_box = QtWidgets.QComboBox()
+        self.align_box.addItem("Search all", "auto")
+        self.align_box.addItem("Barely moved", "small")
+        self.align_box.addItem("Known turn", "hint")
+        # The item text has to stay short or it sets the width of the whole
+        # side panel; the explanation lives here instead.
+        self.align_box.setToolTip(
+            "How much you can tell it about how the rig moved.\n\n"
+            "Search all: no assumptions, tries every heading. Slowest, and in "
+            "a bare symmetric room it can pick the alignment that is 180 "
+            "degrees out.\n"
+            "Barely moved: assumes the rig is near where it was, facing much "
+            "the same way. Fastest and safest for a small nudge.\n"
+            "Known turn: you give the rough heading change below and it works "
+            "out the rest. Being 20 degrees out is fine.")
+        self.align_box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            if hasattr(QtWidgets.QComboBox, "SizeAdjustPolicy")
+            else QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.align_box.setMinimumContentsLength(10)
+        self.align_box.currentIndexChanged.connect(self._on_align_changed)
+        f.addWidget(QtWidgets.QLabel("Movement"), row, 0)
+        f.addWidget(self.align_box, row, 1)
+        row += 1
+
+        self.yaw_spin = QtWidgets.QDoubleSpinBox()
+        self.yaw_spin.setRange(-180.0, 180.0)
+        self.yaw_spin.setValue(0.0)
+        self.yaw_spin.setSuffix(" deg")
+        self.yaw_spin.setToolTip(
+            "How far the rig was turned about the vertical since the previous "
+            "scan -- not since the first one. Positive is anticlockwise seen "
+            "from above.\n"
+            "Eyeballing it is fine: 20 degrees out still lands correctly.")
+        self.yaw_lbl = QtWidgets.QLabel("Turned by")
+        f.addWidget(self.yaw_lbl, row, 0)
+        f.addWidget(self.yaw_spin, row, 1)
+        row += 1
+
+        self.reg_voxel_spin = QtWidgets.QDoubleSpinBox()
+        self.reg_voxel_spin.setRange(5.0, 500.0)
+        self.reg_voxel_spin.setValue(40.0)
+        self.reg_voxel_spin.setSuffix(" mm")
+        self.reg_voxel_spin.setToolTip(
+            "Detail the alignment works at. Smaller is more precise and "
+            "slower, and below the noise on a single shot it stops helping. "
+            "40 mm suits a room.")
+        f.addWidget(QtWidgets.QLabel("Detail"), row, 0)
+        f.addWidget(self.reg_voxel_spin, row, 1)
+        row += 1
+
+        self.add_btn = QtWidgets.QPushButton("Add scan")
+        self.add_btn.setToolTip(
+            "Align the scan on screen onto the map and add it. The first one "
+            "goes in as-is and defines the map's frame.")
+        self.add_btn.clicked.connect(self._add_scan)
+        f.addWidget(self.add_btn, row, 0)
+        self.undo_btn = QtWidgets.QPushButton("Remove last")
+        self.undo_btn.setToolTip("Take the most recently added scan back out.")
+        self.undo_btn.clicked.connect(self._undo_scan)
+        f.addWidget(self.undo_btn, row, 1)
+        row += 1
+
+        # Shown only while an alignment is waiting on the operator. No
+        # threshold can tell a correct alignment from the mirror-image one a
+        # symmetric room also admits, so the last word is a human looking at
+        # the overlap on screen.
+        self.accept_btn = QtWidgets.QPushButton("Keep")
+        self.accept_btn.clicked.connect(self._accept_pending)
+        f.addWidget(self.accept_btn, row, 0)
+        self.reject_btn = QtWidgets.QPushButton("Discard")
+        self.reject_btn.clicked.connect(self._reject_pending)
+        f.addWidget(self.reject_btn, row, 1)
+        row += 1
+
+        self.map_lbl = QtWidgets.QLabel("map empty")
+        self.map_lbl.setWordWrap(True)
+        self.map_lbl.setStyleSheet("color: #9a9a9a;")
+        f.addWidget(self.map_lbl, row, 0, 1, 2)
+        row += 1
+
+        self.clear_map_btn = QtWidgets.QPushButton("Clear map")
+        self.clear_map_btn.setToolTip(
+            "Throw away every added scan and start the map over. The raw .bin "
+            "stream is untouched.")
+        self.clear_map_btn.clicked.connect(self._clear_map)
+        f.addWidget(self.clear_map_btn, row, 0, 1, 2)
+
         return g
 
     def _view_group(self):
@@ -1136,7 +1326,7 @@ class ScannerUI(QtWidgets.QMainWindow):
 
         self.half_lbl = QtWidgets.QLabel("")
         self.half_lbl.setWordWrap(True)
-        self.half_lbl.setStyleSheet("color: #b26a00;")
+        self.half_lbl.setStyleSheet("color: #e0a030;")
         f.addWidget(self.half_lbl, 10, 0, 1, 2)
 
         # --- Microstep non-linearity ----------------------------------------
@@ -1340,7 +1530,7 @@ class ScannerUI(QtWidgets.QMainWindow):
 
         self.mesh_lbl = QtWidgets.QLabel("no surface built")
         self.mesh_lbl.setWordWrap(True)
-        self.mesh_lbl.setStyleSheet("color: #666;")
+        self.mesh_lbl.setStyleSheet("color: #9a9a9a;")
         f.addWidget(self.mesh_lbl, 9, 0, 1, 2)
 
         note = meshing.missing_note()
@@ -1348,13 +1538,13 @@ class ScannerUI(QtWidgets.QMainWindow):
             warn = QtWidgets.QLabel(note.splitlines()[0])
             warn.setWordWrap(True)
             warn.setToolTip(note)
-            warn.setStyleSheet("color: #b26a00;")
+            warn.setStyleSheet("color: #e0a030;")
             f.addWidget(warn, 10, 0, 1, 2)
         else:
             # Which library ran matters when comparing results with someone
             # else's machine, and it is otherwise invisible.
             via = QtWidgets.QLabel(f"via {meshing.backend()}")
-            via.setStyleSheet("color: #666;")
+            via.setStyleSheet("color: #9a9a9a;")
             f.addWidget(via, 10, 0, 1, 2)
 
         # Every knob that changes the geometry itself schedules a rebuild.
@@ -1421,6 +1611,11 @@ class ScannerUI(QtWidgets.QMainWindow):
             "scan/stepped": self.stepped_chk,
             "scan/steps": self.steps_spin,
             "scan/dwell": self.dwell_spin,
+            "map/multi": self.multi_chk,
+            "map/auto_add": self.auto_add_chk,
+            "map/align": self.align_box,
+            "map/yaw_hint": self.yaw_spin,
+            "map/voxel": self.reg_voxel_spin,
             "view/mode": self.mode_box,
             "view/color_by": self.color_box,
             "view/point_size": self.size_spin,
@@ -1496,6 +1691,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         self._on_half_changed()
         self._on_algo_changed()
         self._on_cam_mode_changed()
+        self._on_multi_changed()
         # Last, and unconditionally: it decides which half of the panel is
         # visible, so it has to run even when nothing was restored.
         self._on_view_mode_changed()
@@ -1546,8 +1742,8 @@ class ScannerUI(QtWidgets.QMainWindow):
 
         rec = None
         if self.record_chk.isChecked():
-            rec = time.strftime("scan_%Y%m%d_%H%M%S.bin")
-            rec = os.path.join(os.getcwd(), rec)
+            rec = scan_path(time.strftime("scan_%Y%m%d_%H%M%S.bin"),
+                            "autosaves")
 
         self.cap = sp.Capture()
         # New session, new stream. Reassigned rather than cleared so a reader
@@ -1646,6 +1842,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.cap.samples.clear()
         self.cap.telem.clear()
         self.cloud = None
+        self.live = None
         self.loaded_rgb = None
         self._built_n = 0
         self.mesh = None
@@ -1654,16 +1851,254 @@ class ScannerUI(QtWidgets.QMainWindow):
         self._update_mesh_label()
         self.scatter.setData(pos=np.zeros((0, 3)))
         self.progress.setValue(0)
+        # Scans already added to the map are not part of "the scene": clearing
+        # is what happens at the start of every sweep, and it must not be the
+        # thing that throws away an hour of mapping. Clear map does that, and
+        # only when it is asked for.
+        self._compose()
         self.statusBar().showMessage("scene cleared", 3000)
         self._log("scene cleared (the raw stream is kept -- Save .bin still "
-                  "has everything)")
+                  "has everything)"
+                  + (f"; {len(self.scans)} mapped scans kept"
+                     if self.scans else ""))
+
+    # --- multi-scan map -----------------------------------------------------
+
+    def _on_multi_changed(self):
+        on = self.multi_chk.isChecked()
+        for w in (self.auto_add_chk, self.align_box, self.reg_voxel_spin,
+                  self.add_btn, self.undo_btn, self.clear_map_btn):
+            w.setEnabled(on)
+        self._on_align_changed()
+        self._update_map_ui()
+
+    def _on_align_changed(self):
+        hint = (self.multi_chk.isChecked()
+                and self.align_box.currentData() == "hint")
+        self.yaw_lbl.setVisible(hint)
+        self.yaw_spin.setVisible(hint)
+
+    def _map_cloud(self):
+        """The union of every added scan, in the map's frame. None if empty.
+
+        Cached because it is rebuilt only when a scan is added or removed, and
+        read on every redraw.
+        """
+        if not self.scans:
+            return None
+        if self._map is None:
+            xyz = np.vstack([reg.apply(s["T"], s["xyz"]) for s in self.scans])
+            dist = np.concatenate([s["dist"] for s in self.scans])
+            self._map = (xyz, dist)
+        return self._map
+
+    def _compose(self):
+        """Assemble what is on screen: the map, plus the sweep not yet added.
+
+        Single-scan mode falls out of this for free -- with no added scans the
+        map is empty and this is just the live cloud, which is what it always
+        was.
+        """
+        parts, dists = [], []
+        m = self._map_cloud()
+        if m is not None:
+            parts.append(m[0])
+            dists.append(m[1])
+        self._map_n = sum(p.shape[0] for p in parts)
+
+        if self._pending is not None:
+            # Show the candidate alignment in place, so accepting or rejecting
+            # it is a question about something visible rather than about a
+            # number.
+            parts.append(reg.apply(self._pending["result"]["T"],
+                                   self._pending["xyz"]))
+            dists.append(self._pending["dist"])
+        elif self.live is not None:
+            parts.append(self.live[0])
+            dists.append(self.live[1])
+
+        if not parts:
+            self.cloud = None
+            self.scatter.setData(pos=np.zeros((0, 3)))
+            self._update_map_ui()
+            return
+        self.cloud = (np.vstack(parts).astype(np.float32),
+                      np.concatenate(dists))
+        if len(parts) > 1:
+            # Colours loaded from a .ply only describe that one cloud; there is
+            # nothing to paint the rest of the map with.
+            self.loaded_rgb = None
+        self._redraw()
+        self._update_map_ui()
+
+    def _update_map_ui(self):
+        pend = self._pending is not None
+        busy = self._reg_worker is not None and self._reg_worker.isRunning()
+        for w in (self.accept_btn, self.reject_btn):
+            w.setVisible(pend)
+        on = self.multi_chk.isChecked()
+        self.add_btn.setEnabled(on and not pend and not busy)
+        self.undo_btn.setEnabled(on and bool(self.scans) and not busy)
+        self.clear_map_btn.setEnabled(on and bool(self.scans) and not busy)
+
+        if pend:
+            return          # the pending message stays until it is resolved
+        if not self.scans:
+            self.map_lbl.setText("map empty" if on else "")
+            return
+        n = sum(s["xyz"].shape[0] for s in self.scans)
+        self.map_lbl.setText(f"{len(self.scans)} scans in map, {n} points")
+
+    def _add_scan(self):
+        """Align the sweep on screen onto the map and add it."""
+        if not self.multi_chk.isChecked():
+            return
+        if self._pending is not None:
+            self._log("resolve the pending alignment first")
+            return
+        if self._reg_worker is not None and self._reg_worker.isRunning():
+            self._log("an alignment is already running")
+            return
+        if self.live is None or not self.live[0].shape[0]:
+            self._log("nothing to add - no scan on screen")
+            return
+
+        xyz, dist = self.live
+        if not self.scans:
+            # The first scan defines the frame everything else is measured in,
+            # so it goes in exactly as it came out of the scanner.
+            self._commit(xyz, dist, reg.identity(), "first scan (reference)")
+            self._log(f"map started from {xyz.shape[0]} points - move the rig "
+                      f"and scan again")
+            return
+
+        target = self._map_cloud()[0]
+        params = {"voxel": self.reg_voxel_spin.value()}
+        mode = self.align_box.currentData()
+        if mode == "small":
+            params["init"] = reg.identity()
+        elif mode == "hint":
+            # The operator knows how far they turned the rig since the *last*
+            # scan; the map's frame is the *first* one, and after a few scans
+            # those are nowhere near each other. Asking for the turn relative
+            # to the map would be asking them to do the bookkeeping, and
+            # getting it 40 degrees wrong is enough to misalign the scan -- so
+            # add the previous scan's heading here instead.
+            prev = self.scans[-1]["T"]
+            prev_yaw = np.degrees(np.arctan2(prev[1, 0], prev[0, 0]))
+            params["yaw_hint"] = prev_yaw + self.yaw_spin.value()
+
+        self.map_lbl.setText("aligning...")
+        self._reg_worker = RegisterWorker(xyz.astype(np.float64),
+                                          target.astype(np.float64),
+                                          params, self)
+        self._reg_worker.note.connect(
+            lambda s: self.map_lbl.setText(f"aligning: {s}"))
+        self._reg_worker.done.connect(self._on_register_done)
+        self._reg_worker.failed.connect(self._on_register_failed)
+        self._reg_worker.start()
+        self._update_map_ui()
+
+    def _on_register_failed(self, msg):
+        self._log(f"alignment failed: {msg}")
+        self.map_lbl.setText("alignment failed - see log")
+        self._update_map_ui()
+
+    def _on_register_done(self, result):
+        if self.live is None:
+            return
+        level, why = reg.verdict(result)
+        xyz, dist = self.live
+        self._pending = {"result": result, "xyz": xyz, "dist": dist}
+        self._log(f"alignment: {reg.pose_summary(result['T'])}; {why}")
+
+        colour, lead = {
+            reg.GOOD: ("#66bb6a", "Looks right"),
+            reg.CHECK: ("#ffa726", "Worth a look"),
+            reg.POOR: ("#ef5350", "Probably wrong"),
+        }[level]
+        self.map_lbl.setStyleSheet(f"color: {colour};")
+        self.map_lbl.setText(
+            f"{lead} -- {why}. The new scan is drawn in orange: check it lines "
+            "up with the blue map, then keep or discard it.")
+        self._compose()
+        self._update_map_ui()
+
+        # Auto-add commits only what is clearly right. Anything less stops for
+        # a look: a wrong merge corrupts the map silently and there is no way
+        # to tell afterwards which scan did it.
+        if level == reg.GOOD and self.auto_add_chk.isChecked():
+            self._accept_pending()
+        elif self.auto_add_chk.isChecked():
+            self._log("not added automatically - look it over and press Keep, "
+                      "or try a different Movement setting")
+
+    def _accept_pending(self):
+        if self._pending is None:
+            return
+        p = self._pending
+        self._pending = None
+        self.map_lbl.setStyleSheet("color: #9a9a9a;")
+        self._commit(p["xyz"], p["dist"], p["result"]["T"],
+                     f"scan {len(self.scans) + 1}")
+        self._log(f"added scan {len(self.scans)} to the map "
+                  f"({p['xyz'].shape[0]} points)")
+
+    def _reject_pending(self):
+        if self._pending is None:
+            return
+        self._pending = None
+        self.map_lbl.setStyleSheet("color: #9a9a9a;")
+        self._log("alignment discarded - the scan is still on screen, so you "
+                  "can try again with a different Movement setting")
+        self._compose()
+        self._update_map_ui()
+
+    def _commit(self, xyz, dist, T, label):
+        self.scans.append({"xyz": xyz, "dist": dist, "T": np.asarray(T, float),
+                           "label": label})
+        self._map = None
+        # The sweep has become part of the map; leaving it as the live cloud
+        # too would draw it twice and offer it for adding a second time.
+        self.live = None
+        self._compose()
+        self._mesh_param_changed()
+
+    def _undo_scan(self):
+        if not self.scans:
+            return
+        s = self.scans.pop()
+        self._map = None
+        self._log(f"removed {s['label']} from the map "
+                  f"({s['xyz'].shape[0]} points)")
+        self._compose()
+        self._update_map_ui()
+
+    def _clear_map(self):
+        if not self.scans:
+            return
+        n = len(self.scans)
+        self.scans.clear()
+        self._map = None
+        self._pending = None
+        self.map_lbl.setStyleSheet("color: #9a9a9a;")
+        self._log(f"map cleared ({n} scans dropped)")
+        self._compose()
+        self._update_map_ui()
 
     def _start(self):
         # Push the settings first so the sweep always runs with what is on
         # screen, rather than whatever the device happened to still hold.
 
+        # A new sweep answers whatever question the pending alignment was
+        # asking, so it does not survive into it.
+        if self._pending is not None:
+            self._log("starting a new scan - pending alignment discarded")
+            self._pending = None
+            self.map_lbl.setStyleSheet("color: #9a9a9a;")
+
         self._clear_scene()
-        
+
         if self._push_settings():
             self._send("s")
             self.sweep_started = None
@@ -1718,6 +2153,13 @@ class ScannerUI(QtWidgets.QMainWindow):
         # Indexed via the named constants in scan_proto, because the record has
         # already grown once and hand-counted offsets silently drifted.
         self.state = int(telem[sp.TEL_STATE])
+        # Note the sweep finishing, but do not act on it here: the last samples
+        # are still arriving behind the telemetry that announced it, and adding
+        # the scan now would map a cloud missing its tail. _refresh fires it
+        # once the built cloud has caught up with the capture.
+        if self.state == sp.STATE_DONE and self._last_state != sp.STATE_DONE:
+            self._sweep_done = True
+        self._last_state = self.state
         platform = telem[sp.TEL_PLATFORM]
         dropped = int(telem[sp.TEL_DROPPED])
         self.platform = float(platform)
@@ -1759,6 +2201,11 @@ class ScannerUI(QtWidgets.QMainWindow):
         self._check_link()
         if self.link and len(self.cap) != self._built_n:
             self._rebuild()
+        elif getattr(self, "_sweep_done", False):
+            # The cloud now holds every sample of the finished sweep.
+            self._sweep_done = False
+            if self.multi_chk.isChecked() and self.auto_add_chk.isChecked():
+                self._add_scan()
 
     def _check_link(self):
         """Report a connected-but-silent link instead of looking idle.
@@ -1779,7 +2226,7 @@ class ScannerUI(QtWidgets.QMainWindow):
 
         if n == 0 and age > 3.0 and not self.warned_silent:
             self.warned_silent = True
-            self.link_lbl.setStyleSheet("color: #c62828; font-weight: bold;")
+            self.link_lbl.setStyleSheet("color: #ef5350; font-weight: bold;")
             self.link_lbl.setText(f"NO DATA after {age:.0f}s - see log")
             self._log(
                 "--- port is open but the device has sent nothing ---\n"
@@ -1818,9 +2265,9 @@ class ScannerUI(QtWidgets.QMainWindow):
         if self.voxel_spin.value():
             xyz, (dist,) = sp.voxel_downsample(xyz, [dist],
                                                self.voxel_spin.value())
-        self.cloud = (xyz, dist)
+        self.live = (xyz, dist)
         self.loaded_rgb = None
-        self._redraw()
+        self._compose()
 
     # --- geometry mode ------------------------------------------------------
 
@@ -1983,7 +2430,16 @@ class ScannerUI(QtWidgets.QMainWindow):
         if self.cloud is None:
             return
         xyz, dist = self.cloud
-        if self.loaded_rgb is not None:
+        if self._pending is not None:
+            # Judging an alignment means seeing which points came from where:
+            # one ramp over the union hides the seam, which is the only thing
+            # worth looking at. Map cool, candidate warm -- where they overlap
+            # correctly the two interleave, and where they do not it is obvious.
+            n_map = getattr(self, "_map_n", 0)
+            rgba = np.empty((xyz.shape[0], 4), np.float32)
+            rgba[:n_map] = (0.30, 0.55, 0.75, 1.0)
+            rgba[n_map:] = (1.00, 0.52, 0.10, 1.0)
+        elif self.loaded_rgb is not None:
             rgba = np.empty((xyz.shape[0], 4), np.float32)
             rgba[:, :3] = self.loaded_rgb
             rgba[:, 3] = 1.0
@@ -2016,14 +2472,26 @@ class ScannerUI(QtWidgets.QMainWindow):
     # --- files --------------------------------------------------------------
 
     def _save_ply(self):
-        if not len(self.cap):
+        if not len(self.cap) and not self.scans:
             self._log("nothing to save - no capture data")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save point cloud", time.strftime("scan_%Y%m%d_%H%M%S.ply"),
+            self, "Save point cloud",
+            scan_path(time.strftime("scan_%Y%m%d_%H%M%S.ply")),
             "PLY point cloud (*.ply)")
         if not path:
             return
+
+        # A map is several sweeps that have each been placed by a transform, so
+        # it cannot be rebuilt from the current capture the way a single scan
+        # can -- the capture only holds the last one. Write what is on screen.
+        if self.scans:
+            xyz, dist = self.cloud
+            cloud_io.export_ply(path, xyz, dist)
+            self._log(f"saved map of {len(self.scans)} scans, "
+                      f"{xyz.shape[0]} points -> {os.path.basename(path)}")
+            return
+
         try:
             xyz, dist, _ = sp.build_cloud(
                 self.cap,
@@ -2058,7 +2526,8 @@ class ScannerUI(QtWidgets.QMainWindow):
             self._log("nothing to save - no raw stream captured")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save raw capture", time.strftime("scan_%Y%m%d_%H%M%S.bin"),
+            self, "Save raw capture",
+            scan_path(time.strftime("scan_%Y%m%d_%H%M%S.bin")),
             "Raw capture (*.bin)")
         if not path:
             return
@@ -2074,7 +2543,8 @@ class ScannerUI(QtWidgets.QMainWindow):
     def _save_mesh(self):
         verts, faces = self.mesh
         path, filt = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save surface", time.strftime("scan_%Y%m%d_%H%M%S.ply"),
+            self, "Save surface",
+            scan_path(time.strftime("scan_%Y%m%d_%H%M%S.ply")),
             "PLY mesh (*.ply);;STL mesh (*.stl)")
         if not path:
             return
@@ -2094,7 +2564,7 @@ class ScannerUI(QtWidgets.QMainWindow):
 
     def _load_ply(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load point cloud", "", "PLY point cloud (*.ply)")
+            self, "Load point cloud", SCANS_DIR, "PLY point cloud (*.ply)")
         if not path:
             return
         try:
@@ -2104,32 +2574,47 @@ class ScannerUI(QtWidgets.QMainWindow):
             return
         # A loaded cloud has no range channel, so derive one for the colour
         # ramp when the file carried no vertex colours.
-        self.cloud = (xyz, np.linalg.norm(xyz, axis=1))
+        #
+        # It lands as the live cloud rather than straight onto the display, so
+        # that in multi-scan mode a scan saved earlier can be aligned onto the
+        # map exactly like one that just came off the device.
+        self.live = (xyz, np.linalg.norm(xyz, axis=1))
         self.loaded_rgb = rgb
-        self._redraw()
+        self._compose()
         self._frame_cloud()
         self._mesh_param_changed()
         self._log(f"loaded {xyz.shape[0]} points from {os.path.basename(path)}")
 
     def _load_bin(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open raw capture", "", "Raw capture (*.bin)")
+            self, "Open raw capture", SCANS_DIR, "Raw capture (*.bin)")
         if not path:
             return
-        self.cap = sp.Capture()
-        # Keep the file's bytes as the current stream, so a capture that was
-        # opened rather than recorded can still be saved back out.
         try:
             with open(path, "rb") as fh:
-                self.raw = bytearray(fh.read())
+                data = fh.read()
         except Exception as exc:
             self._log(f"load failed: {exc}")
             return
+        # Cleared in place rather than reassigned, unlike _connect. A live
+        # SerialLink was handed these two objects at construction and its
+        # reader thread decodes straight into them, so rebinding self.cap here
+        # left the link filling a Capture nothing on screen looks at any more:
+        # the device stayed connected, bytes kept arriving, and not one new
+        # point ever appeared. _connect can reassign because it builds the link
+        # afterwards; this cannot.
+        self.cap.samples.clear()
+        self.cap.telem.clear()
+        self.cap.events.clear()
+        self.cap.config = None
+        # Keep the file's bytes as the current stream, so a capture that was
+        # opened rather than recorded can still be saved back out.
+        self.raw[:] = data
         # sweep_only mirrors the live link: the device streams frames in every
         # state, so without it the idle frames either side of the sweep get
         # decoded into the cloud too -- which the live path never shows.
         sp.StreamParser(self.cap, echo_events=False,
-                        sweep_only=True).feed(bytes(self.raw))
+                        sweep_only=True).feed(data)
         # And a file holds the *session*, which may be several sweeps: live,
         # _start clears the scene each time, so only the last one is ever on
         # screen. Without this the sweeps pile into one cloud, which is why a
@@ -2152,11 +2637,53 @@ class ScannerUI(QtWidgets.QMainWindow):
         # away: tearing down a parented QThread mid-run aborts the process.
         if self._mesh_worker is not None and self._mesh_worker.isRunning():
             self._mesh_worker.wait(5000)
+        if self._reg_worker is not None and self._reg_worker.isRunning():
+            self._reg_worker.wait(5000)
         super().closeEvent(ev)
+
+
+def apply_dark_theme(app):
+    """Force the dark palette on every machine.
+
+    Qt does not follow the Windows dark-mode setting, and the platform styles
+    disagree about what to do with a palette they were not built for, so the
+    look drifted between checkouts. Fusion is the one style that honours a
+    custom palette everywhere, so pin both.
+    """
+    app.setStyle("Fusion")
+
+    bg = QtGui.QColor(43, 43, 43)
+    base = QtGui.QColor(30, 30, 30)
+    text = QtGui.QColor(220, 220, 220)
+    disabled = QtGui.QColor(128, 128, 128)
+    highlight = QtGui.QColor(42, 130, 218)
+
+    def role(name):
+        return _enum(QtGui.QPalette, f"ColorRole.{name}", name)
+
+    pal = QtGui.QPalette()
+    for name, c in (("Window", bg), ("WindowText", text),
+                    ("Base", base), ("AlternateBase", bg),
+                    ("ToolTipBase", bg), ("ToolTipText", text),
+                    ("Text", text), ("Button", bg),
+                    ("ButtonText", text), ("BrightText", QtGui.QColor("red")),
+                    ("Link", highlight), ("Highlight", highlight),
+                    ("HighlightedText", QtGui.QColor(0, 0, 0))):
+        pal.setColor(role(name), c)
+
+    greyed = _enum(QtGui.QPalette, "ColorGroup.Disabled", "Disabled")
+    for name in ("WindowText", "Text", "ButtonText", "HighlightedText"):
+        pal.setColor(greyed, role(name), disabled)
+    app.setPalette(pal)
+
+    # The 2D plots keep their own colours, independent of the widget palette.
+    pg.setConfigOption("background", base)
+    pg.setConfigOption("foreground", text)
 
 
 def main():
     app = pg.mkQApp("3D Lidar Scanner")
+    apply_dark_theme(app)
     ui = ScannerUI()
     ui.show()
     sys.exit(app.exec_() if hasattr(app, "exec_") else app.exec())

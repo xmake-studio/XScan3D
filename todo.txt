@@ -1,4 +1,0 @@
-3D SLAM
-actually using scans folder
-working FPS camera
-fix of .bin saving
