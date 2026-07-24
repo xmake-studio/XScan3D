@@ -1272,6 +1272,18 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.stop_btn.clicked.connect(self._stop)
         f.addWidget(self.stop_btn, 6, 1)
 
+        self.delay_spin = QtWidgets.QSpinBox()
+        self.delay_spin.setRange(0, 600)
+        self.delay_spin.setValue(0)
+        self.delay_spin.setSuffix(" s")
+        self.delay_spin.setToolTip(
+            "Wait this many seconds after pressing Start before the sweep "
+            "actually begins. Gives you time to step out of the scan volume. "
+            "0 starts immediately.")
+        self.delay_lbl = QtWidgets.QLabel("Start delay")
+        f.addWidget(self.delay_lbl, 7, 0)
+        f.addWidget(self.delay_spin, 7, 1)
+
         # No unwrap or re-home buttons. The tether does twist as the shaft
         # turns, but the coils are released whenever the rig is idle
         # (SCAN_IDLE_DISABLE_MS in scanner.h), so the shaft is backdrivable and
@@ -2342,6 +2354,41 @@ class ScannerUI(QtWidgets.QMainWindow):
             self._pending = None
             self.map_lbl.setStyleSheet("color: #9a9a9a;")
 
+        delay = self.delay_spin.value()
+        if delay > 0:
+            self._begin_start_countdown(delay)
+        else:
+            self._begin_scan()
+
+    def _begin_start_countdown(self, secs):
+        """Count down `secs` seconds before actually launching the sweep.
+
+        Lets the operator clear the scan volume. Start is disabled while the
+        countdown runs; Stop cancels it.
+        """
+        self._countdown_left = secs
+        self.start_btn.setEnabled(False)
+        self.state_lbl.setText(f"starting in {secs} s")
+        if not hasattr(self, "_countdown_timer"):
+            self._countdown_timer = QtCore.QTimer(self)
+            self._countdown_timer.setInterval(1000)
+            self._countdown_timer.timeout.connect(self._on_countdown_tick)
+        self._countdown_timer.start()
+
+    def _on_countdown_tick(self):
+        self._countdown_left -= 1
+        if self._countdown_left <= 0:
+            self._cancel_countdown()
+            self._begin_scan()
+        else:
+            self.state_lbl.setText(f"starting in {self._countdown_left} s")
+
+    def _cancel_countdown(self):
+        if getattr(self, "_countdown_timer", None) is not None:
+            self._countdown_timer.stop()
+        self.start_btn.setEnabled(True)
+
+    def _begin_scan(self):
         self._clear_scene()
 
         if self._push_settings():
@@ -2350,6 +2397,11 @@ class ScannerUI(QtWidgets.QMainWindow):
             self.progress.setValue(0)
 
     def _stop(self):
+        if getattr(self, "_countdown_timer", None) is not None \
+                and self._countdown_timer.isActive():
+            self._cancel_countdown()
+            self.state_lbl.setText("idle")
+            return
         self._send("x")
 
     # --- signals ------------------------------------------------------------
