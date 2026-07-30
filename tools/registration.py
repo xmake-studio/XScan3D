@@ -304,7 +304,7 @@ def _score(metrics):
 
 def register(source, target, voxel=40.0, levels=3, yaw_steps=12,
              init=None, yaw_hint=None, max_points=60000, progress=None,
-             top_k=4):
+             top_k=4, min_voxel=None, fine_points=150000):
     """Align `source` onto `target`. Returns a dict describing the result.
 
     Keys: T (4x4), fitness (0..1), rmse (mm), voxel, yaw (the coarse yaw the
@@ -322,6 +322,24 @@ def register(source, target, voxel=40.0, levels=3, yaw_steps=12,
     2. Refine the winner coarse-to-fine, each level with a tighter voxel and a
        tighter correspondence gate, so early iterations pull the cloud a long
        way without caring about detail and later ones settle it precisely.
+
+    3. Polish the single winning pose at sub-voxel grids (`voxel` down to
+       `min_voxel`), with far more points than the search levels use. This is
+       the step that makes a merge accurate rather than merely correct. The
+       coarse-to-`voxel` search only pins the transform to a fraction of a
+       40 mm cell; across a room that is many metres wide, a fraction of a
+       degree of leftover rotation is centimetres of error at the far wall --
+       invisible in a single scan, but exactly the wobble that shows up when
+       two clouds are laid on top of each other. Polishing on a fine grid, with
+       enough points spread to the room's edges to give rotation a long lever
+       arm, drives that leftover angle down to the lidar's own precision. Only
+       the winner is polished, because by now the pose is right to a cell and
+       what is left is precision, not which hypothesis -- and the fine grids
+       are the expensive part.
+
+    `min_voxel` is the finest grid the polish descends to (default voxel/4, but
+    never below 8 mm -- past the lidar's own noise there is nothing left to
+    align to). `fine_points` caps the polish clouds.
 
     `progress` is an optional callable taking a short status string.
     """
@@ -436,7 +454,37 @@ def register(source, target, voxel=40.0, levels=3, yaw_steps=12,
         if best is None or score > best[0]:
             best = (score, T, deg, m)
 
-    _, T, yaw, (fitness, rmse, stab, overlap) = best
+    _, T, yaw, m = best
+
+    # Polish the winner on sub-voxel grids. The grids below `voxel` halve down
+    # to min_voxel; each carries fine_points, far more than the search levels,
+    # because it is the points out at the room's edges that give leftover
+    # rotation a long enough lever arm to be seen and removed.
+    if min_voxel is None:
+        min_voxel = max(voxel / 4.0, 8.0)
+    polish_sizes = []
+    size = voxel / 2.0
+    while size >= min_voxel - 1e-9:
+        polish_sizes.append(size)
+        size /= 2.0
+
+    for j, size in enumerate(polish_sizes):
+        say(f"polishing {j + 1}/{len(polish_sizes)} ({size:.0f} mm grid)...")
+        s = prep(src_full, size, fine_points)
+        t = _Target(prep(tgt_full, size, fine_points))
+        # A wider gate than the search's (size*3) at the first, coarsest polish
+        # step: correspondences can still sit a working-voxel apart here, and a
+        # gate tied to the fine grid would drop the very pairs that carry the
+        # correction. It tightens on its own as the grid shrinks.
+        T, _, _ = icp(s, t, init=T, max_dist=max(size * 4.0, voxel * 1.5),
+                      max_iter=40, trim=0.9)
+
+    # Score the polished pose at the working voxel, so `verdict`'s thresholds
+    # (calibrated in units of `voxel`) keep meaning what they meant. The polish
+    # improves T; it does not move the goalposts the result is judged against.
+    s, t = levels_data[-1]
+    fitness, rmse, stab, overlap = evaluate(s, t, T, max_dist=voxel * 3.0)
+
     result.update(T=T, fitness=float(fitness), rmse=float(rmse),
                   stability=float(stab), overlap=float(overlap),
                   yaw=float(yaw))

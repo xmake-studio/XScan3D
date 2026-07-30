@@ -31,7 +31,7 @@
   "mesh/smooth": 0,
   "mesh/surface": "shaded",
   "mesh/trim": 40.0,
-  "port": "COM7",
+  "port": "COM3",
   "record": true,
   "scan/angle": 90.0,
   "scan/dwell": 400,
@@ -43,6 +43,6 @@
   "view/color_by": "height",
   "view/max_range": 0.0,
   "view/mode": "Points",
-  "view/point_size": 0.5,
+  "view/point_size": 2.0,
   "view/voxel": 0.0
 }
