@@ -687,6 +687,43 @@ def keep_last_sweep(cap):
     return n - len(cap.samples)
 
 
+def write_capture(cap):
+    """Re-serialise a Capture back into the .bin wire format -- the inverse of
+    StreamParser.feed().
+
+    Every stored config, sample and telemetry record is packed with its
+    magic+tag header. Samples and telemetry are interleaved in timestamp order
+    (both carry t_us first) so that the sweep-state tracking in feed()/
+    keep_last_sweep() round-trips when the file is read back: a sample is kept on
+    reload exactly when the most recent telemetry said "capturing", which is only
+    reproducible if the two streams are re-merged in time.
+
+    Events are not written back -- they are boot/log chatter, not cloud data.
+    """
+    def _rec(fmt, tag, fields):
+        # Every record struct reserves its first four bytes with "<4x" for the
+        # magic (3) + tag (1); pack fills them with zeros, so stamp them here.
+        rec = bytearray(fmt.pack(*fields))
+        rec[0:3] = MAGIC
+        rec[3] = tag
+        return rec
+
+    out = bytearray()
+    if cap.config is not None:
+        out += _rec(CONFIG_FMT, CONFIG_TAG, cap.config)
+    # kind 0 = sample, 1 = telem; the tie-break keeps a telemetry state change
+    # ahead of the samples that share its timestamp, matching arrival order.
+    merged = ([(s[0], 0, s) for s in cap.samples]
+              + [(t[TEL_T_US], 1, t) for t in cap.telem])
+    merged.sort(key=lambda e: (e[0], e[1]))
+    for _t, kind, rec in merged:
+        if kind:
+            out += _rec(TELEM_FMT, TELEM_TAG, rec)
+        else:
+            out += _rec(SAMPLE_FMT, SAMPLE_TAG, rec)
+    return bytes(out)
+
+
 def voxel_downsample(xyz, extra, size):
     """Keep one point per `size`-mm cube. Cheap way to drop the redundancy that
     piles up close to the sensor, where the angular sampling is densest."""

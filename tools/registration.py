@@ -132,6 +132,210 @@ def estimate_normals(xyz, k=18):
     return vecs[:, :, 0]
 
 
+def _rows_in(a, b):
+    """Boolean mask of which integer rows of `a` also appear in `b`.
+
+    A void view collapses each 3-vector cell key to one comparable scalar, so
+    the membership test is a single vectorised np.isin rather than a Python set
+    over hundreds of thousands of rows.
+    """
+    a = np.ascontiguousarray(a)
+    b = np.ascontiguousarray(b)
+    va = a.view([("", a.dtype)] * a.shape[1]).ravel()
+    vb = b.view([("", b.dtype)] * b.shape[1]).ravel()
+    return np.isin(va, vb)
+
+
+def surface_variation(xyz, k=16):
+    """Per-point l0/(l0+l1+l2) of the local covariance. 0 = flat, ~1/3 = blob.
+
+    The smallest eigenvalue over the total spread: tiny when the neighbourhood
+    is a surface (one thin direction, two wide), large when it is a little
+    volume of points. This is the number that tells vegetation from structure.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    n = xyz.shape[0]
+    if n < 3:
+        return np.zeros(n)
+    k = int(min(k, n))
+    tree = cKDTree(xyz)
+    _, idx = tree.query(xyz, k=k, workers=-1)
+    nbr = xyz[idx] - xyz[idx].mean(axis=1, keepdims=True)
+    cov = np.einsum("nki,nkj->nij", nbr, nbr) / max(k - 1, 1)
+    ev = np.linalg.eigvalsh(cov)                       # ascending l0<=l1<=l2
+    return ev[:, 0] / (ev.sum(axis=1) + 1e-12)
+
+
+def structure_filter(xyz, voxel=40.0, k=16, max_variation=0.06):
+    """Keep points on surfaces; drop volumetric clutter (foliage, grass).
+
+    Outdoors this is the difference between a merge that works and one that
+    only looks like it should. Leaves and grass move between scans -- wind, and
+    they are not rigid -- so they never truly correspond, yet they are often
+    the majority of the points. Worse, a point buried in a bush has an
+    isotropic neighbourhood, so its PCA normal is essentially random, and
+    point-to-plane ICP turns each one into a meaningless constraint. The
+    combination drags the solve and inflates every residual, so a correct
+    building alignment reports a poor fit and gets stamped 'check'.
+
+    A point is 'surface' when its neighbourhood's surface variation is small:
+    walls, ground, steps, trunks stay; canopy and grass go. The judgement is
+    made on a `voxel`-grid downsample -- raw per-point density swamps the
+    neighbourhood shape otherwise, and the grid is the scale alignment works at
+    anyway. Full-resolution points are then kept or dropped by which cell they
+    fell in, so the density the fine polish needs survives the filter.
+
+    Fails safe: if almost nothing reads as structural (an indoor scan already
+    all surfaces, or a threshold set too tight), the original cloud is returned
+    rather than stripped to nothing.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.shape[0] < k or voxel <= 0:
+        return xyz
+    d = voxel_downsample(xyz, voxel)
+    if d.shape[0] < k:
+        return xyz
+    keep = surface_variation(d, k=k) <= max_variation
+    if int(keep.sum()) < 10:
+        return xyz
+    # The same integer grid maps full-resolution points back to their cell: a
+    # cell's centroid floors to that cell, so the keys line up exactly.
+    dkeys = np.floor(d[keep] / voxel).astype(np.int64)
+    fkeys = np.floor(xyz / voxel).astype(np.int64)
+    return xyz[_rows_in(fkeys, dkeys)]
+
+
+def wall_footprint(xyz, voxel=80.0, max_nz=0.35):
+    """The scene's floor plan: points on near-vertical surfaces, seen from above.
+
+    Seen from directly above, an outdoor scan is a solid disc -- the ground fills
+    every cell out to the lidar's range, and one disc looks exactly like another.
+    Drop everything but the near-vertical surfaces and what is left is thin
+    lines: wall faces, step risers, fence posts, trunks. That is the scene's
+    actual plan view, and it is what makes two stations recognisably the same
+    place from above.
+
+    Fails safe: a scan with no vertical structure at all (an open field) returns
+    the downsampled cloud rather than nothing, so the caller still gets a usable
+    -- if uninformative -- footprint instead of an empty array.
+    """
+    d = voxel_downsample(xyz, voxel)
+    if d.shape[0] < 20:
+        return d
+    n = estimate_normals(d, k=18)
+    w = d[np.abs(n[:, 2]) < max_nz]
+    return w if w.shape[0] >= 20 else d
+
+
+def _plan_grid(xy, lo, shape, cell):
+    """Binary occupancy of `xy` on a `cell`-mm raster starting at `lo`.
+
+    Binary, not a count: point density falls off with range and with how square
+    a surface sat to the beam, so counts would let a near wall outvote the whole
+    rest of the plan. Presence is the part that is comparable between stations.
+    """
+    g = np.zeros(shape, dtype=np.float32)
+    k = np.floor((xy - lo) / cell).astype(np.int64)
+    ok = ((k >= 0) & (k < np.array(shape))).all(axis=1)
+    k = k[ok]
+    if k.shape[0]:
+        g[k[:, 0], k[:, 1]] = 1.0
+    return g
+
+
+def footprint_starts(source, target, yaw_steps=36, cell=100.0, per_yaw=3,
+                     top=8, voxel=80.0, max_cells=512):
+    """Whole-pose guesses from correlating the two clouds' floor plans.
+
+    Returns [(T, yaw_deg)] best first -- at most `top`, deduplicated.
+
+    This exists because a yaw ring with the centroids brought together is not a
+    search over position at all: it offers exactly one translation per angle,
+    and it assumes the two clouds' centroids are the same point of the world.
+    Indoors that roughly holds -- both stations see the same four walls, so both
+    centroids sit near the middle of the room. Outdoors it does not: each
+    station sees a different slice of whatever is around it out to the lidar's
+    range, so the centroids are pulled apart by that difference rather than by
+    the baseline the operator actually walked. The guess can be metres out while
+    ICP's correspondence gate is centimetres, and then every hypothesis in the
+    ring starts outside the basin and converges to junk. No amount of extra
+    iterations or finer grids recovers from it, because nothing was ever
+    pointing at the right answer.
+
+    Correlating plan views searches position properly instead. For each yaw the
+    FFT scores *every* translation on the grid at once -- the peak is where the
+    two floor plans line up -- so the cost is one transform per angle rather
+    than one ICP per (angle, position) pair, and no basin has to be guessed at.
+
+    `per_yaw` peaks are taken per angle because the true pose is not always the
+    single tallest: a building front correlates well anywhere it slides along
+    its own wall, and the runner-up peak is often the one with the corner in the
+    right place. Refinement sorts them out; the point here is only to get the
+    right answer into the candidate set.
+    """
+    src = np.asarray(source, float)
+    tgt = np.asarray(target, float)
+    ws = wall_footprint(src, voxel=voxel)
+    wt = wall_footprint(tgt, voxel=voxel)
+    if ws.shape[0] < 20 or wt.shape[0] < 20:
+        return []
+
+    # One raster big enough that no rotation of the source can slide off it, and
+    # coarse enough that the transform stays cheap on a big outdoor scene.
+    ext = max(float(np.ptp(wt[:, :2], axis=0).max()),
+              float(np.ptp(ws[:, :2], axis=0).max()))
+    n = int(np.ceil(ext / cell)) * 2 + 4
+    if n > max_cells:
+        cell *= n / max_cells
+        n = max_cells
+    shape = (n, n)
+
+    t_lo = wt[:, :2].mean(axis=0) - n * cell / 2.0
+    F = np.fft.rfft2(_plan_grid(wt[:, :2], t_lo, shape, cell))
+
+    # Height is not part of the search: the rig stands on the ground at both
+    # stations, so matching the two clouds' median height is already inside
+    # ICP's reach, and searching it would multiply the candidates for nothing.
+    dz = float(np.median(tgt[:, 2]) - np.median(src[:, 2]))
+
+    found = []
+    for k in range(int(max(yaw_steps, 1))):
+        deg = 360.0 * k / max(yaw_steps, 1)
+        R2 = yaw_matrix(deg)[:2, :2]
+        s = ws[:, :2] @ R2.T
+        s_lo = s.mean(axis=0) - n * cell / 2.0
+        H = _plan_grid(s, s_lo, shape, cell)
+        # Circular cross-correlation. Normalising by the source's own occupied
+        # count keeps angles comparable: a rotation that rasterises to more
+        # cells would otherwise score higher just for being fatter.
+        c = np.fft.irfft2(F * np.conj(np.fft.rfft2(H)), shape)
+        c = c / max(float(H.sum()), 1.0)
+        for f in np.argsort(c.ravel())[::-1][:int(max(per_yaw, 1))]:
+            i, j = np.unravel_index(f, shape)
+            # A circular shift past the halfway point is a negative one.
+            di = i - shape[0] if i > shape[0] // 2 else i
+            dj = j - shape[1] if j > shape[1] // 2 else j
+            d = (t_lo - s_lo) + np.array([di, dj], float) * cell
+            found.append((float(c[i, j]), deg, d[0], d[1]))
+
+    found.sort(key=lambda r: -r[0])
+    out, seen = [], []
+    for _sc, deg, dx, dy in found:
+        # Neighbouring cells of one peak are the same hypothesis; ICP pulls them
+        # to an identical pose, so keeping them only crowds out real
+        # alternatives further down the list.
+        key = (deg, round(dx / (cell * 3.0)), round(dy / (cell * 3.0)))
+        if key in seen:
+            continue
+        seen.append(key)
+        T = yaw_matrix(deg)
+        T[:3, 3] = [dx, dy, dz]
+        out.append((T, deg))
+        if len(out) >= int(top):
+            break
+    return out
+
+
 class _Target:
     """A target cloud prepared once and reused across ICP iterations."""
 
@@ -304,7 +508,8 @@ def _score(metrics):
 
 def register(source, target, voxel=40.0, levels=3, yaw_steps=12,
              init=None, yaw_hint=None, max_points=60000, progress=None,
-             top_k=4, min_voxel=None, fine_points=150000):
+             top_k=4, min_voxel=None, fine_points=150000,
+             structure=False, struct_max_variation=0.06, struct_k=16):
     """Align `source` onto `target`. Returns a dict describing the result.
 
     Keys: T (4x4), fitness (0..1), rmse (mm), voxel, yaw (the coarse yaw the
@@ -341,12 +546,20 @@ def register(source, target, voxel=40.0, levels=3, yaw_steps=12,
     never below 8 mm -- past the lidar's own noise there is nothing left to
     align to). `fine_points` caps the polish clouds.
 
+    `structure` turns on vegetation rejection (see structure_filter): both
+    clouds are stripped to surface points before the transform is solved *and*
+    before it is scored, so foliage stops injecting random point-to-plane
+    constraints into the solve and stops inflating the residual the verdict
+    reads. The returned T is still expressed in the input frame and applies to
+    the full, unfiltered clouds -- filtering only selects which points vote.
+
     `progress` is an optional callable taking a short status string.
     """
     src_full = np.asarray(source, dtype=np.float64)
     tgt_full = np.asarray(target, dtype=np.float64)
     result = {"T": identity(), "fitness": 0.0, "rmse": float("inf"),
               "stability": 0.0, "overlap": 0.0, "voxel": voxel, "yaw": 0.0,
+              "structured": bool(structure),
               "source_points": int(src_full.shape[0]),
               "target_points": int(tgt_full.shape[0])}
     if src_full.shape[0] < 100 or tgt_full.shape[0] < 100:
@@ -355,6 +568,17 @@ def register(source, target, voxel=40.0, levels=3, yaw_steps=12,
     def say(msg):
         if progress is not None:
             progress(msg)
+
+    if structure:
+        say("finding structure (ignoring foliage)...")
+        src_full = structure_filter(src_full, voxel=voxel, k=struct_k,
+                                    max_variation=struct_max_variation)
+        tgt_full = structure_filter(tgt_full, voxel=voxel, k=struct_k,
+                                    max_variation=struct_max_variation)
+        result["source_structure_points"] = int(src_full.shape[0])
+        result["target_structure_points"] = int(tgt_full.shape[0])
+        if src_full.shape[0] < 100 or tgt_full.shape[0] < 100:
+            return result
 
     # Level 0 is the coarsest. Downsampling is what makes this tractable: a
     # room scan is millions of points and ICP does not get any better answer
@@ -420,11 +644,19 @@ def register(source, target, voxel=40.0, levels=3, yaw_steps=12,
         starts = [(from_yaw(float(yaw_hint)), float(yaw_hint))]
         say(f"using yaw hint {float(yaw_hint):.0f} deg")
     else:
+        say("matching floor plans...")
+        # Plan-view correlation first: it is the only part of the search that
+        # actually looks for *where* the second station stood, rather than
+        # assuming the centroids answer that. Cheap enough (one FFT per angle)
+        # to run unconditionally.
+        plan = footprint_starts(src_full, tgt_full, cell=max(voxel * 2.5, 50.0))
+
         say("searching orientation...")
         candidates = [(identity(), 0.0)]
         for k in range(int(max(yaw_steps, 1))):
             deg = 360.0 * k / max(yaw_steps, 1)
             candidates.append((from_yaw(deg), deg))
+        candidates.extend(plan)
 
         # Screen cheaply, then refine the best few properly.
         #
@@ -435,14 +667,28 @@ def register(source, target, voxel=40.0, levels=3, yaw_steps=12,
         # hypothesis close enough for that difference to show, and the alias
         # would out-score the truth. Fully converged, the truth wins -- so the
         # decision has to be made after refinement, not before it.
+        n_ring = len(candidates) - len(plan)
         screened = []
-        for T0, deg in candidates:
+        for i, (T0, deg) in enumerate(candidates):
             T1, _, _ = icp(coarse_src, coarse_tgt, init=T0,
                            max_dist=sizes[0] * 3.0, max_iter=12, trim=0.7)
             m = evaluate(coarse_src, coarse_tgt, T1, max_dist=sizes[0] * 1.5)
-            screened.append((_score(m), T1, deg))
+            screened.append((_score(m), T1, deg, i >= n_ring))
         screened.sort(key=lambda r: -r[0])
-        starts = [(T1, deg) for _, T1, deg in screened[:max(int(top_k), 1)]]
+        starts = [(T1, deg) for _, T1, deg, _p in screened[:max(int(top_k), 1)]]
+
+        # The screen is twelve iterations on the coarsest grid, and at that
+        # resolution a plan-view hypothesis that is right has not yet pulled
+        # ahead of the ring hypotheses that are merely parked on the ground
+        # plane -- the same reason the winner cannot be picked from screening
+        # alone. So the best-screened plan candidate is refined whether or not
+        # it made the cut. It is one extra refinement, and on the scans where
+        # the ring is hopeless it is the only one that matters.
+        if plan and not any(p for _s, _T, _d, p in screened[:max(int(top_k), 1)]):
+            for _s, T1, deg, p in screened:
+                if p:
+                    starts.append((T1, deg))
+                    break
 
     best = None
     for i, (T0, deg) in enumerate(starts):
