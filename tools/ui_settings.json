@@ -48,7 +48,7 @@
   "view/color_by": "By object",
   "view/grid": true,
   "view/max_range": 0.0,
-  "view/mode": "Points",
+  "view/mode": "Surface",
   "view/point_size": 0.5,
   "view/voxel": 0.0
 }

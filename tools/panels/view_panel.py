@@ -178,9 +178,7 @@ class ViewPanel(QtWidgets.QWidget):
             warn.setStyleSheet("color: #e0a030;")
             sf.addRow(warn)
 
-        for w in (self.depth_spin, self.trim_spin, self.radius_spin,
-                  self.alpha_spin, self.smooth_spin, self.budget_spin):
-            w.valueChanged.connect(self.ctrl.on_mesh_param_changed)
+        # Parameter changes no longer auto-trigger builds; use "Build surface" button only
 
         f.addRow(self.surf_group)
         self._on_algo_changed()
@@ -240,4 +238,3 @@ class ViewPanel(QtWidgets.QWidget):
             self.budget_spin.blockSignals(True)
             self.budget_spin.setValue(want)
             self.budget_spin.blockSignals(False)
-        self.ctrl.on_mesh_param_changed()
