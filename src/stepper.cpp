@@ -288,6 +288,42 @@ void Stepper::runToNewPosition(long absolute) {
   runToPosition();
 }
 
+void Stepper::playTone(uint16_t freqHz, uint16_t ms, uint8_t swing,
+                       uint16_t fadeMs) {
+  if (freqHz == 0) { delay(ms); lastStep_ = micros(); return; }
+  if (swing == 0) swing = 1;
+  const uint32_t period = 1000000UL / freqHz;
+  uint32_t cycles = ((uint32_t)ms * freqHz) / 1000UL;
+  if (cycles == 0) cycles = 1;
+  uint32_t fade = ((uint32_t)fadeMs * freqHz) / 1000UL;
+  if (fade > cycles / 2) fade = cycles / 2;
+
+  const bool savedDir = dir_;
+  uint32_t t = micros();
+  for (uint32_t i = 0; i < cycles; i++) {
+    // Swing for this cycle: ramps 1 -> swing over the fade-in, and mirrors
+    // that over the fade-out.
+    uint32_t s = swing;
+    if (fade > 0) {
+      const uint32_t edge = i < cycles - 1 - i ? i : cycles - 1 - i;
+      if (edge < fade) s = 1 + (swing - 1) * edge / fade;
+    }
+    // 2*s pulses per cycle, evenly spaced, so the pitch holds while the
+    // amplitude changes.
+    const uint32_t gap = period / (2 * s);
+    for (uint8_t half = 0; half < 2; half++) {
+      setDirection(half == 0);
+      for (uint32_t k = 0; k < s; k++) {
+        pulse();
+        t += gap;
+        while ((int32_t)(micros() - t) < 0) {}
+      }
+    }
+  }
+  setDirection(savedDir);
+  lastStep_ = micros();
+}
+
 void Stepper::stepOnce(bool forward) {
   setDirection(forward);
   pulse();

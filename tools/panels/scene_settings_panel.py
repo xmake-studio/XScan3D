@@ -3,11 +3,12 @@
 
 Two things live here. The scene bits -- name, units, and the .scene file
 actions -- describe the project. The mount geometry -- lidar roll, azimuth
-direction, emitter spacing, scan half, upright flip, microstep correction --
-describes how the sensor is bolted together, so it is dialled in once by eye and
-then applies to every scan built from the device or a .bin. Changing it rebuilds
-those scans in place, which is how the emitter spacing and microstep are tuned:
-watch a flat surface and wind the knob until it flattens.
+direction, emitter spacing, scan half, upright flip, scan-plane tilt --
+describes how the sensor is bolted together, so it is dialled in once (by eye or
+with Calibrate from scan) and then applies to every scan built from the
+device or a .bin. Changing it rebuilds those scans in place, which is how the
+emitter spacing is tuned: watch a flat surface and wind the knob until it
+flattens. The microstep correction is the exception: it is measured per scan.
 """
 
 from pyqtgraph.Qt import QtWidgets
@@ -20,6 +21,7 @@ class SceneSettingsPanel(QtWidgets.QWidget):
     def __init__(self, ctrl):
         super().__init__()
         self.ctrl = ctrl
+        self._calib_running = False
         self._build()
 
     def _build(self):
@@ -138,37 +140,96 @@ class SceneSettingsPanel(QtWidgets.QWidget):
         f.addWidget(self.flip_chk, r, 0, 1, 2)
         r += 1
 
-        self.ustep_spin = QtWidgets.QDoubleSpinBox()
-        self.ustep_spin.setRange(0.0, 0.2)
-        self.ustep_spin.setDecimals(4)
-        self.ustep_spin.setSingleStep(0.0025)
-        self.ustep_spin.setValue(sp.MICROSTEP_ERROR_DEG)
-        self.ustep_spin.setSuffix(" deg")
-        self.ustep_spin.setToolTip(
-            "How far the rotor sits from the microstep the firmware asked for. "
-            "Flattens the one-full-step ripple on a wall. Set the phase first; "
-            "0 disables. Tune on one long clean wall.")
-        self.ustep_spin.valueChanged.connect(self.ctrl.on_geometry_changed)
-        f.addWidget(QtWidgets.QLabel("Microstep error"), r, 0)
-        f.addWidget(self.ustep_spin, r, 1)
+        self.tilt_spin = QtWidgets.QDoubleSpinBox()
+        self.tilt_spin.setRange(-10.0, 10.0)
+        self.tilt_spin.setDecimals(2)
+        self.tilt_spin.setSingleStep(0.05)
+        self.tilt_spin.setValue(sp.SCAN_TILT_DEG)
+        self.tilt_spin.setSuffix(" deg")
+        self.tilt_spin.setToolTip(
+            "How far the lidar's scan plane leans off the rotation axis. "
+            "Invisible at eye level; wrong, it twists a nearby wall into a "
+            "saddle and smears anything overhead around the zenith. Set it with "
+            "Calibrate from scan.")
+        self.tilt_spin.valueChanged.connect(self.ctrl.on_geometry_changed)
+        f.addWidget(QtWidgets.QLabel("Scan-plane tilt"), r, 0)
+        f.addWidget(self.tilt_spin, r, 1)
         r += 1
 
-        self.ustep_phase_spin = QtWidgets.QDoubleSpinBox()
-        self.ustep_phase_spin.setRange(0.0, 360.0)
-        self.ustep_phase_spin.setDecimals(0)
-        self.ustep_phase_spin.setSingleStep(15.0)
-        self.ustep_phase_spin.setWrapping(True)
-        self.ustep_phase_spin.setValue(sp.MICROSTEP_ERROR_PHASE)
-        self.ustep_phase_spin.setSuffix(" deg")
-        self.ustep_phase_spin.setToolTip(
-            "Where within the full step the correction is applied. 360 is one "
-            "full step. Sweep this until the ripple is weakest, then trim the "
-            "amplitude.")
-        self.ustep_phase_spin.valueChanged.connect(self.ctrl.on_geometry_changed)
-        f.addWidget(QtWidgets.QLabel("Microstep phase"), r, 0)
-        f.addWidget(self.ustep_phase_spin, r, 1)
+        self.ustep_chk = QtWidgets.QCheckBox("Auto microstep correction")
+        self.ustep_chk.setChecked(True)
+        self.ustep_chk.setToolTip(
+            "Measures how far the rotor sits from each commanded microstep "
+            "from the flat surfaces in the scan itself, and corrects for it. "
+            "Removes the waves a long wall picks up in step with the motor. "
+            "Fitted once per finished scan, which takes a second or two.")
+        self.ustep_chk.stateChanged.connect(self.ctrl.on_geometry_changed)
+        f.addWidget(self.ustep_chk, r, 0, 1, 2)
+        r += 1
+
+        self.calib_btn = QtWidgets.QPushButton("Calibrate from scan…")
+        self.calib_btn.setToolTip(
+            "Fits Lidar roll, Emitter spacing and Scan-plane tilt to the "
+            "selected scan (or the latest one): walls and ceiling flat, the "
+            "two ends of the sweep meeting cleanly. Needs a ±90° sweep of an "
+            "ordinary room. Takes a few minutes; you choose whether to apply "
+            "the result.")
+        self.calib_btn.clicked.connect(self._on_calib_clicked)
+        f.addWidget(self.calib_btn, r, 0, 1, 2)
+        r += 1
+
+        self.calib_bar = QtWidgets.QProgressBar()
+        self.calib_bar.setRange(0, 1000)
+        self.calib_bar.setTextVisible(False)
+        self.calib_bar.setMaximumHeight(8)
+        self.calib_bar.hide()
+        f.addWidget(self.calib_bar, r, 0, 1, 2)
+        r += 1
+
+        self.calib_lbl = QtWidgets.QLabel("")
+        self.calib_lbl.setWordWrap(True)
+        self.calib_lbl.setStyleSheet("color: #9a9a9a; font-size: 11px;")
+        self.calib_lbl.hide()
+        f.addWidget(self.calib_lbl, r, 0, 1, 2)
         r += 1
         return g
+
+    # --- calibration --------------------------------------------------------
+
+    def _on_calib_clicked(self):
+        if self._calib_running:
+            self.ctrl.cancel_calibration()
+        else:
+            self.ctrl.start_calibration()
+
+    def set_calibration_running(self, running):
+        self._calib_running = running
+        self.calib_btn.setText("Cancel calibration" if running
+                               else "Calibrate from scan…")
+        self.calib_bar.setVisible(running)
+        if running:
+            self.calib_bar.setValue(0)
+        # The fit starts from these; changing them mid-run would not be seen.
+        for w in (self.lidar_rot_spin, self.spacing_spin, self.tilt_spin,
+                  self.reverse_chk):
+            w.setEnabled(not running)
+
+    def set_calibration_progress(self, text, fraction):
+        self.calib_bar.setValue(int(fraction * 1000))
+        self.set_calibration_text(text)
+
+    def set_calibration_text(self, text):
+        self.calib_lbl.setText(text)
+        self.calib_lbl.setVisible(bool(text))
+
+    def set_mount(self, rotation, spacing, tilt):
+        """Set the three fitted values with one rebuild instead of three."""
+        for w, v in ((self.lidar_rot_spin, rotation),
+                     (self.spacing_spin, spacing), (self.tilt_spin, tilt)):
+            w.blockSignals(True)
+            w.setValue(v)
+            w.blockSignals(False)
+        self.ctrl.on_geometry_changed()
 
     def _on_half_changed(self):
         one_side = self.half_box.currentData() != sp.SCAN_HALF_BOTH
@@ -190,8 +251,8 @@ class SceneSettingsPanel(QtWidgets.QWidget):
                     flip_upright=self.flip_chk.isChecked(),
                     emitter_spacing=self.spacing_spin.value(),
                     half=self.half_box.currentData(),
-                    microstep_error=self.ustep_spin.value(),
-                    microstep_phase=self.ustep_phase_spin.value())
+                    scan_tilt=self.tilt_spin.value(),
+                    microstep="auto" if self.ustep_chk.isChecked() else None)
 
     def scene_name(self):
         return self.name_edit.text().strip()

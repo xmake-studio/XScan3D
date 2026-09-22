@@ -45,12 +45,22 @@ class NewScanPanel(QtWidgets.QWidget):
         self.connect_btn.clicked.connect(self.ctrl.toggle_connect)
         f.addWidget(self.connect_btn, 1, 0, 1, 3)
 
+        self.auto_chk = QtWidgets.QCheckBox("Auto-connect to the scanner")
+        self.auto_chk.setChecked(True)
+        self.auto_chk.setToolTip(
+            "Watch for the scanner and connect as soon as it is plugged in, "
+            "including after a replug or a firmware upload. It is recognised "
+            "by its USB descriptor only, so other RP2040 boards are never "
+            "opened. Disconnect by hand to pause it until the next replug.")
+        self.auto_chk.stateChanged.connect(self.ctrl.on_auto_connect_changed)
+        f.addWidget(self.auto_chk, 2, 0, 1, 3)
+
         self.dtr_chk = QtWidgets.QCheckBox("Assert DTR (needed by RP2040 USB)")
         self.dtr_chk.setChecked(True)
         self.dtr_chk.setToolTip(
             "The RP2040's USB serial only sends once the host raises DTR. If "
             "the device connects but stays silent, try toggling this.")
-        f.addWidget(self.dtr_chk, 2, 0, 1, 3)
+        f.addWidget(self.dtr_chk, 3, 0, 1, 3)
 
         self.record_chk = QtWidgets.QCheckBox("Record raw stream alongside scan")
         self.record_chk.setChecked(False)
@@ -58,11 +68,11 @@ class NewScanPanel(QtWidgets.QWidget):
             "Write a scan_*.bin into scans/autosaves as the scan runs. Off by "
             "default: the same bytes are kept in memory either way, so Save .bin "
             "can write them afterwards.")
-        f.addWidget(self.record_chk, 3, 0, 1, 3)
+        f.addWidget(self.record_chk, 4, 0, 1, 3)
 
         self.link_lbl = QtWidgets.QLabel("not connected")
         self.link_lbl.setWordWrap(True)
-        f.addWidget(self.link_lbl, 4, 0, 1, 3)
+        f.addWidget(self.link_lbl, 5, 0, 1, 3)
         return g
 
     # --- scan ---------------------------------------------------------------
@@ -214,6 +224,14 @@ class NewScanPanel(QtWidgets.QWidget):
 
     def record(self):
         return self.record_chk.isChecked()
+
+    def auto_connect(self):
+        return self.auto_chk.isChecked()
+
+    def select_port(self, device):
+        i = self.port_box.findText(device)
+        if i >= 0:
+            self.port_box.setCurrentIndex(i)
 
     def set_ports(self, ports):
         current = self.port_box.currentText()

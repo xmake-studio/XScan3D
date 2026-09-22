@@ -78,6 +78,17 @@
 
 #define TELEM_PERIOD_MS 100
 
+// --- Completion chime -------------------------------------------------------
+// When a scan is done and the platform is back home, the motor itself plays a
+// two-note chime. Volume is the swing of each note in microsteps (see the note
+// table in playChime): 16 is a full step each way and loudest, 4 is moderate,
+// 1 is barely audible. Lower notes come out louder for the same swing -- the
+// coil current has longer to build each cycle -- so each note has its own.
+// Beyond that the ceiling is set by the A4988 Vref (coil current).
+// Set SCAN_CHIME_ENABLED to 0 to scan in silence.
+#define SCAN_CHIME_ENABLED 1
+#define SCAN_CHIME_FADE_MS 25   // attack and release, so nothing clicks
+
 enum ScanState : uint8_t {
   SCAN_IDLE = 0,
   SCAN_PARKING,    // travelling to -SCAN_DEGREES
@@ -114,6 +125,7 @@ class Scanner {
   void abort(const char *why);
   void emitEvent(const char *fmt, ...);
 
+  void playChime();                    // blocking, ~0.4 s, only when parked
   void advanceStep();                  // move to the next stop, or finish
   float stepAngle(uint16_t i) const;   // shaft degrees at stop `i`
 

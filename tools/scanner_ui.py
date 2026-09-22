@@ -32,12 +32,13 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 import scan_proto as sp
+import device_detect as dd
 import cloud_io
 import registration as reg
 
 from widgets import (FileSettings, SETTINGS_PATH, SCANS_DIR, scan_path,
                      apply_dark_theme, disable_wheel_edits, NO_FRAME)
-from workers import SerialLink, MeshWorker, RegisterWorker
+from workers import SerialLink, MeshWorker, RegisterWorker, CalibrateWorker
 from scene_model import Scene, Scan, identity
 from scene_view import SceneView, SceneRenderer, CAM_FPS
 import scene_io
@@ -70,6 +71,18 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.warned_silent = False
         self.sweep_started = None
 
+        # --- auto-detect state ---
+        self._ports = []               # last dd.scan_ports() result
+        self._port_sig = None          # (device, product) tuple, to spot changes
+        self._link_serial = None       # USB serial of the board on the link
+        self._link_auto = False        # link was opened by auto-detect
+        self._link_valid = False       # link has sent a config record
+        # Serials auto-connect must leave alone until they are unplugged: the
+        # user disconnected them by hand, or the link to them failed. Cleared
+        # as soon as the serial drops off the bus, so a replug (or the
+        # re-enumeration after a firmware upload) connects again.
+        self._auto_hold = set()
+
         # --- meshing state ---
         self._mesh = None              # (verts, faces)
         self._mesh_info = {}
@@ -79,6 +92,10 @@ class ScannerUI(QtWidgets.QMainWindow):
         self._mesh_debounce.setSingleShot(True)
         self._mesh_debounce.setInterval(600)
         self._mesh_debounce.timeout.connect(self.build_surface)
+
+        # --- mount calibration ---
+        self._calib_worker = None
+        self._calib_scan = None        # name of the scan being fitted
 
         # --- SLAM state ---
         self._reg_worker = None
@@ -106,6 +123,13 @@ class ScannerUI(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(250)
+
+        # Enumeration only reads the OS device list -- no port is opened -- so
+        # polling it is cheap and cannot disturb the other boards.
+        self.detect_timer = QtCore.QTimer(self)
+        self.detect_timer.timeout.connect(self._poll_devices)
+        self.detect_timer.start(1500)
+        QtCore.QTimer.singleShot(0, self._poll_devices)
 
     # --- construction -------------------------------------------------------
 
@@ -368,12 +392,19 @@ class ScannerUI(QtWidgets.QMainWindow):
         if hasattr(self, "settings_panel"):
             self._rebuild_capture_scans()
 
-    def _build_xyz(self, cap):
+    def _build_xyz(self, cap, live=False):
         """(xyz, dist) from a capture with the current mount geometry and build
-        filters, or (empty, empty) if there is no sweep data yet."""
+        filters, or (empty, empty) if there is no sweep data yet.
+
+        `live` is for a sweep still arriving: the microstep fit takes a second
+        or two and the capture changes every tick, so a live build reuses
+        whatever was last fitted (nothing, on a fresh sweep) and the finished
+        sweep is fitted once when it completes."""
         if not len(cap):
             return (np.zeros((0, 3), np.float32), np.zeros((0,), np.float32))
         geom = self.settings_panel.geometry()
+        if live and geom["microstep"] == "auto":
+            geom["microstep"] = sp.cached_microstep(cap)
         filt = self.view_panel.build_filters()
         try:
             xyz, dist, _ = sp.build_cloud(cap, max_range=filt["max_range"],
@@ -394,7 +425,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         touched = False
         for s in self.scene.scans:
             if s.raw is not None and len(s.raw):
-                s.xyz, s.dist = self._build_xyz(s.raw)
+                s.xyz, s.dist = self._build_xyz(s.raw, live=s.generating)
                 touched = True
         if touched:
             self._refresh_all()
@@ -402,21 +433,79 @@ class ScannerUI(QtWidgets.QMainWindow):
     # --- device -------------------------------------------------------------
 
     def refresh_ports(self):
-        from serial.tools import list_ports
-        ports = [(p.device, p.description) for p in list_ports.comports()]
-        self.newscan.set_ports(ports)
+        self._port_sig = None
+        self._poll_devices()
+
+    def _poll_devices(self):
+        try:
+            ports = dd.scan_ports()
+        except Exception as exc:
+            self._log(f"port scan failed: {exc}")
+            return
+        self._ports = ports
+        present = {p.serial for p in ports if p.serial}
+        self._auto_hold &= present
+
+        sig = tuple((p.device, p.product) for p in ports)
+        if sig != self._port_sig:
+            self._port_sig = sig
+            self.newscan.set_ports(
+                [(p.device, f"{p.description} [{dd.PRODUCT}]"
+                  if p.is_scanner_product else p.description) for p in ports])
+
+        if self.link:
+            # Unplugged under a live link: the read may not fail promptly, so
+            # let go as soon as the OS no longer lists the port.
+            if self.link.port not in {p.device for p in ports}:
+                self._log(f"{self.link.port} was unplugged")
+                self._disconnect()
+            else:
+                return
+
+        if not hasattr(self, "settings") or not self.newscan.auto_connect():
+            return
+        known = self.settings.value("device/known_serials") or []
+        for p in dd.find_scanner(ports, known):
+            if p.serial in self._auto_hold:
+                continue
+            why = ("USB product " + repr(p.product)
+                   if p.is_scanner_product else "remembered serial")
+            self._log(f"scanner found on {p.device} ({why}), connecting")
+            self._connect(p.device, auto=True)
+            return
+
+    def on_auto_connect_changed(self, *_):
+        if hasattr(self, "detect_timer") and self.newscan.auto_connect():
+            self._poll_devices()
+
+    def _serial_of(self, device):
+        for p in self._ports:
+            if p.device == device:
+                return p.serial
+        return None
 
     def toggle_connect(self):
         if self.link:
+            # A deliberate disconnect: don't let auto-connect grab the board
+            # straight back. It resumes once the board is replugged.
+            if self._link_serial:
+                self._auto_hold.add(self._link_serial)
             self._disconnect()
         else:
             self._connect()
 
-    def _connect(self):
-        port = self.newscan.port()
+    def _connect(self, port=None, auto=False):
+        if port is None:
+            port = self.newscan.port()
         if not port or port.startswith("("):
             self._log("no serial port selected")
             return
+        self.newscan.select_port(port)
+        self._link_serial = self._serial_of(port)
+        self._link_auto = auto
+        self._link_valid = False
+        if self._link_serial:
+            self._auto_hold.discard(self._link_serial)
         rec = None
         if self.newscan.record():
             rec = scan_path(time.strftime("scan_%Y%m%d_%H%M%S.bin"),
@@ -551,11 +640,27 @@ class ScannerUI(QtWidgets.QMainWindow):
     # --- device signals -----------------------------------------------------
 
     def _on_failed(self, msg):
+        if self.sender() is not None and self.sender() is not self.link:
+            return                     # a link already torn down (unplug)
         self._log(f"serial error: {msg}")
+        # Busy port, dead link, ...: retrying every poll would only spam the
+        # log. Wait for a replug (or a manual Connect) instead.
+        if self._link_serial:
+            self._auto_hold.add(self._link_serial)
         self.statusBar().showMessage(f"error: {msg}")
         self._disconnect()
 
     def _on_config(self, cfg):
+        if not self._link_valid:
+            # Only the scanner firmware sends a config record: remember this
+            # board, so auto-connect finds it even without the USB product
+            # string (older firmware).
+            self._link_valid = True
+            known = list(self.settings.value("device/known_serials") or [])
+            if self._link_serial and self._link_serial not in known:
+                known.append(self._link_serial)
+                self.settings.setValue("device/known_serials", known)
+                self.settings.sync()
         deg = cfg[sp.CFG_DEGREES]
         secs = cfg[sp.CFG_TIME]
         stepped = int(cfg[sp.CFG_MODE]) == sp.MODE_STEPPED
@@ -611,17 +716,20 @@ class ScannerUI(QtWidgets.QMainWindow):
             self._built_n = len(self.cap)
             g = self.scene.get(self.generating_id)
             if g is not None:
-                g.xyz, g.dist = self._build_xyz(self.cap)
+                g.xyz, g.dist = self._build_xyz(self.cap, live=True)
                 self.renderer.sync()
                 self.scene_panel.refresh()
         elif self._sweep_done:
             self._sweep_done = False
             # The cloud now holds every sample of the finished sweep; settle the
-            # live object into a normal scan.
+            # live object into a normal scan, and give it the full build the
+            # live ticks skipped (the microstep fit).
             if self.generating_id is not None:
                 g = self.scene.get(self.generating_id)
                 if g is not None:
                     g.generating = False
+                    if g.raw is not None:
+                        g.xyz, g.dist = self._build_xyz(g.raw)
                 self.generating_id = None
                 self._refresh_all()
 
@@ -631,6 +739,16 @@ class ScannerUI(QtWidgets.QMainWindow):
             return
         n = self.link.bytes_in
         age = time.time() - self.connected_at
+        if self._link_auto and not self._link_valid and age > 5.0:
+            # Auto-connected but it never answered like the scanner: some other
+            # firmware on a remembered board. Let go and leave it alone.
+            self._log(f"{self.link.port} did not answer as the scanner, "
+                      "releasing it until it is replugged")
+            if self._link_serial:
+                self._auto_hold.add(self._link_serial)
+            self._disconnect()
+            self.newscan.set_link_text("not connected")
+            return
         self.newscan.set_link_text(
             f"{n} bytes in, {self.link.cmds_sent} commands sent"
             + (f", {len(self.cap)} samples" if len(self.cap) else ""))
@@ -703,6 +821,95 @@ class ScannerUI(QtWidgets.QMainWindow):
         self._mesh_worker = None
         self.view_panel.set_mesh_label(msg)
         self._log(f"reconstruction failed: {msg}")
+
+    # --- mount calibration ----------------------------------------------------
+
+    def _calibration_source(self):
+        """The scan to calibrate on: the first selected one that still has its
+        raw capture, else the most recent such scan. None if there is none."""
+        usable = [s for s in self.scene.scans
+                  if s.raw is not None and len(s.raw) and not s.generating]
+        for s in self.scene.selected():
+            if s in usable:
+                return s
+        return usable[-1] if usable else None
+
+    def start_calibration(self):
+        if self._calib_worker is not None and self._calib_worker.isRunning():
+            return
+        g = self.settings_panel
+        scan = self._calibration_source()
+        if scan is None:
+            g.set_calibration_text(
+                "Needs a scan with its raw data: finish a sweep, or open a "
+                ".bin (File menu).")
+            return
+        self._calib_scan = scan.name
+        self._calib_worker = CalibrateWorker(
+            scan.raw, g.lidar_rot_spin.value(), g.spacing_spin.value(),
+            g.tilt_spin.value(), g.reverse_chk.isChecked(), parent=self)
+        self._calib_worker.progress.connect(g.set_calibration_progress)
+        self._calib_worker.done.connect(self._on_calibration_done)
+        self._calib_worker.failed.connect(self._on_calibration_failed)
+        g.set_calibration_running(True)
+        g.set_calibration_text(f"calibrating on “{scan.name}”...")
+        self._calib_worker.start()
+
+    def cancel_calibration(self):
+        if self._calib_worker is not None:
+            self._calib_worker.cancel()
+            self.settings_panel.set_calibration_text("cancelling...")
+
+    def _on_calibration_failed(self, msg):
+        self._calib_worker = None
+        self.settings_panel.set_calibration_running(False)
+        self.settings_panel.set_calibration_text(
+            "Calibration cancelled." if msg == "cancelled"
+            else f"Calibration failed: {msg}")
+
+    def _on_calibration_done(self, r):
+        self._calib_worker = None
+        g = self.settings_panel
+        g.set_calibration_running(False)
+        old = (g.lidar_rot_spin.value(), g.spacing_spin.value(),
+               g.tilt_spin.value())
+        new = (r["rotation"], r["spacing"], r["tilt"])
+        b, a = r["before"], r["after"]
+
+        def row(name, x, y, unit, fmt):
+            return (f"<tr><td>{name}</td><td align=right>{x:{fmt}}{unit}</td>"
+                    f"<td align=right><b>{y:{fmt}}{unit}</b></td></tr>")
+        text = (
+            f"<p>Fitted on “{self._calib_scan}”"
+            + (f" (long sweep: 1 of every {r['stride']} lidar frames)"
+               if r.get("stride", 1) > 1 else "") + ".</p>"
+            "<table cellspacing=6><tr><th></th><th>now</th><th>fitted</th></tr>"
+            + row("Lidar roll", old[0], new[0], "°", ".2f")
+            + row("Emitter spacing", old[1], new[1], " mm", ".1f")
+            + row("Scan-plane tilt", old[2], new[2], "°", "+.2f")
+            + "<tr><td colspan=3><br><i>Error, mm (lower is better)</i></td></tr>"
+            + row("Walls / ceiling", b["planes"], a["planes"], "", ".2f")
+            + row("Seam overhead", b["up"], a["up"], "", ".2f")
+            + row("Seam at horizon", b["horizon"], a["horizon"], "", ".2f")
+            + row("Seam below", b["down"], a["down"], "", ".2f")
+            + "</table><p>Apply the fitted values?</p>")
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Mount calibration")
+        box.setTextFormat(QtCore.Qt.TextFormat.RichText
+                          if hasattr(QtCore.Qt, "TextFormat")
+                          else QtCore.Qt.RichText)
+        box.setText(text)
+        yes, no = _enum_msg("Yes"), _enum_msg("No")
+        box.setStandardButtons(yes | no)
+        box.setDefaultButton(yes)
+        if box.exec() == yes:
+            g.set_mount(*new)
+            self._save_settings()
+            g.set_calibration_text(
+                f"Applied: roll {new[0]:.2f}°, spacing {new[1]:.1f} mm, "
+                f"tilt {new[2]:+.2f}°.")
+        else:
+            g.set_calibration_text("Fitted values discarded.")
 
     # --- SLAM ---------------------------------------------------------------
 
@@ -1136,6 +1343,7 @@ class ScannerUI(QtWidgets.QMainWindow):
         g = self.settings_panel
         self._persist = {
             "port": n.port_box, "dtr": n.dtr_chk, "record": n.record_chk,
+            "auto_connect": n.auto_chk,
             "scan/angle": n.angle_spin, "scan/time": n.time_spin,
             "scan/stepped": n.stepped_chk, "scan/steps": n.steps_spin,
             "scan/dwell": n.dwell_spin, "scan/delay": n.delay_spin,
@@ -1153,8 +1361,8 @@ class ScannerUI(QtWidgets.QMainWindow):
             "geom/lidar_reverse": g.reverse_chk,
             "geom/emitter_spacing": g.spacing_spin,
             "geom/scan_half": g.half_box, "geom/flip_upright": g.flip_chk,
-            "geom/microstep_error": g.ustep_spin,
-            "geom/microstep_phase": g.ustep_phase_spin,
+            "geom/scan_tilt": g.tilt_spin,
+            "geom/microstep_auto": g.ustep_chk,
         }
         self._restore_settings()
         for w in self._persist.values():
@@ -1229,7 +1437,10 @@ class ScannerUI(QtWidgets.QMainWindow):
     def closeEvent(self, ev):
         self._save_settings()
         self._disconnect()
-        for worker in (self._mesh_worker, self._reg_worker):
+        if self._calib_worker is not None:
+            self._calib_worker.cancel()
+        for worker in (self._mesh_worker, self._reg_worker,
+                       self._calib_worker):
             if worker is not None and worker.isRunning():
                 worker.wait(5000)
         super().closeEvent(ev)

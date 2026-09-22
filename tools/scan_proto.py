@@ -18,7 +18,10 @@ import numpy as np
 
 MAGIC = bytes((0x55, 0xAA, 0x03))
 
-SAMPLE_TAG, SAMPLE_LEN = 0x20, 32
+SAMPLE_TAG, SAMPLE_LEN = 0x22, 34
+# Samples from before the firmware forwarded the lidar's end angle. Still
+# decoded so older .bin captures open; they get END_ANGLE_UNKNOWN.
+LEGACY_SAMPLE_TAG, LEGACY_SAMPLE_LEN = 0x20, 32
 TELEM_TAG, TELEM_LEN = 0x10, 16
 CONFIG_TAG, CONFIG_LEN = 0x14, 20
 EVENT_TAG = 0x09
@@ -132,15 +135,47 @@ SCAN_HALF_NAMES = {
 # The shaft turns about world Z: this is a plain yaw, and nothing else.
 SPIN_AXIS = (0.0, 0.0, 1.0)
 
+# --- Scan-plane tilt ----------------------------------------------------------
+#
+# Everything above assumes the lidar's scan plane contains the rotation axis.
+# If the lidar sits even slightly rolled on its bracket, it does not: the plane
+# leans by SCAN_TILT_DEG about its own horizontal in-plane axis, and a beam that
+# the reconstruction thinks points straight up actually points a little to the
+# side -- perpendicular to the slice, i.e. tangentially around the shaft.
+#
+# The sideways error is d*sin(tilt)*cos(th): nothing at the horizon, most
+# straight up and straight down. It also flips sign between the two halves of
+# the revolution, because the lidar's own sideways axis points the other way
+# relative to a point on the far side. So each half is twisted about the pole,
+# in opposite directions, by an angle that grows as a point nears the axis:
+#
+#   * walls stay put at eye level and around the seam, which is why the two
+#     halves still glue together cleanly at the horizon and this hides well;
+#   * a wall close to the rig twists into a saddle, top and bottom rotating
+#     opposite ways;
+#   * anything nearly overhead -- an air conditioner above the rig, a lamp --
+#     is smeared around the pole, and where the halves meet it arrives twice,
+#     side by side, 2*d*sin(tilt) apart. A degree is 50 mm at 1.5 m.
+#
+# Only a rotation about this one axis matters. A roll inside the scan plane is
+# LIDAR_ROTATION_DEG, and a yaw about the vertical is just a shaft-angle offset,
+# which moves the whole cloud rigidly.
+#
+# Fitted, together with LIDAR_ROTATION_DEG and EMITTER_SPACING_MM, against the
+# walls and ceiling of scans/room.bin (Mount geometry -> Calibrate from scan,
+# or tools/calibrate_mount.py). Negative means
+# the beam at the top of the slice leans toward the lidar's -Y side.
+SCAN_TILT_DEG = -1.2
+
 # --- Microstep non-linearity ------------------------------------------------
 #
 # The firmware counts microsteps and reports the angle it *commanded*; the rotor
 # goes where the A4988's two coil currents actually put it, which is not quite
-# the same place. On a hybrid stepper the two disagree periodically, and the
-# period is the full step -- the rotor is pulled toward the nearest detent, so
-# the 16 microsteps inside a full step bunch up rather than dividing it evenly.
-# It is a property of the motor and the driver, not of the load, and it does not
-# average out over a sweep: every full step is wrong the same way.
+# the same place. The two disagree periodically, and the period is set by the
+# driver's current table, not the load: it repeats every electrical cycle, four
+# full steps (7.2 deg). On this rig most of the error is at half that (3.6 deg,
+# two full steps) and a quarter (1.8 deg, one full step), about 0.17 and 0.09
+# deg -- more than a whole microstep peak to peak.
 #
 # What it does to the cloud: the sample is placed at the commanded azimuth
 # instead of the true one, so it is misplaced *tangentially*, by delta * r. On a
@@ -151,43 +186,49 @@ SPIN_AXIS = (0.0, 0.0, 1.0)
 # and g is the along-wall distance from the point where the wall comes closest
 # to the rotation axis. So the error vanishes where the wall faces the sensor
 # head-on and grows as the wall runs away to either side -- which is why it
-# reads as ripples that get stronger toward the ends of a long wall, spaced one
-# full step apart. At 1 m along the wall a one-microstep error is a 2 mm bump;
-# at 3 m it is 6 mm.
+# reads as waves that get stronger toward the ends of a long wall. At 2 m along
+# the wall 0.17 deg is a 6 mm wave.
 #
-# The correction is a single sinusoid on the commanded angle. Both numbers have
-# to be dialled in against a flat wall, the same way EMITTER_SPACING_MM is,
-# because they belong to one specific motor:
-#
-#   * MICROSTEP_ERROR_DEG is the amplitude, in degrees of shaft angle. Zero
-#     disables the whole correction. A tenth to a half of a microstep (0.011 to
-#     0.056) is the range worth trying; wind it up until the ripple flattens.
-#   * MICROSTEP_ERROR_PHASE slides the correction within the full step, in
-#     degrees of the 1.8 deg cycle (so 360 here is one full step). The amplitude
-#     alone will not flatten anything at the wrong phase, and the two interact:
-#     sweep the phase at a fixed amplitude, then trim the amplitude.
-#
-# A warning about tuning this by eye: unlike the emitter spacing, this knob can
-# manufacture structure that was not there. Bending the azimuth at the full-step
-# period will always find *something* to flatten in a noisy cloud. Set it on a
-# scan with one long clean wall, then check the numbers still help on a second
-# scan of somewhere else before believing them.
-MICROSTEP_ERROR_DEG = 0.0
-MICROSTEP_ERROR_PHASE = 0.0
+# The correction is a Fourier series over the electrical cycle, and it is not a
+# constant: which point of the cycle is "commanded position 0" depends on where
+# the translator happened to be when the platform was homed or the board
+# booted, so the phase can change from one session to the next. Rather than ask
+# for it to be dialled in, fit_microstep() measures it from each scan itself:
+# every flat patch in the cloud that was swept by many microsteps is a ruler,
+# and the error is the one periodic function of shaft angle that flattens all
+# of them at once. It needs nothing but a room with some walls in it.
 
-# Degrees of shaft per full step: 1.8 for a 200-step motor. The microstep
-# resolution does not enter -- the error repeats with the full step regardless
-# of how finely it is divided.
+# Degrees of shaft per full step: 1.8 for a 200-step motor.
 FULL_STEP_DEG = 1.8
+# The period of the driver's current table: four full steps. Every harmonic of
+# it -- 3.6, 2.4, 1.8 ... deg -- is fitted; the microstep resolution does not
+# enter.
+ELECTRICAL_CYCLE_DEG = 4 * FULL_STEP_DEG
+# Harmonics of the electrical cycle to fit. 8 reaches down to a period of
+# 0.9 deg, which is well past where this motor has any error left.
+MICROSTEP_HARMONICS = 8
 
 
-def correct_microstep(platform_deg, amp=MICROSTEP_ERROR_DEG,
-                      phase=MICROSTEP_ERROR_PHASE):
-    """Commanded shaft angle -> best estimate of the true one."""
-    if not amp:
-        return platform_deg
+def _microstep_basis(platform_deg, harmonics):
+    """(N,) shaft angles -> (N, 2*harmonics) cos/sin columns."""
+    w = (2.0 * np.pi / ELECTRICAL_CYCLE_DEG) * np.asarray(
+        platform_deg, dtype=np.float64)[:, None] * np.arange(1, harmonics + 1)
+    return np.concatenate([np.cos(w), np.sin(w)], axis=1)
+
+
+def correct_microstep(platform_deg, coef):
+    """Commanded shaft angle -> best estimate of the true one.
+
+    `coef` is what fit_microstep() returns: cos then sin coefficients, in
+    degrees, of the harmonics of the electrical cycle. None or empty leaves the
+    angle alone.
+    """
     th = np.asarray(platform_deg, dtype=np.float64)
-    return th + amp * np.sin(np.radians(360.0 * th / FULL_STEP_DEG + phase))
+    if coef is None or not len(coef):
+        return th
+    coef = np.asarray(coef, dtype=np.float64)
+    return th + _microstep_basis(th.ravel(), len(coef) // 2).dot(
+        coef).reshape(th.shape)
 
 # Rotation of the lidar about its own spin axis, in degrees clockwise (the same
 # sense the azimuth below runs in).
@@ -233,8 +274,11 @@ POINTS = 8
 DIST_INVALID = 0x8000
 DIST_MASK = 0x7FFF
 
-# struct PktSample: magic[4] t_us platformDeg speed rawAngle dist[8]
-SAMPLE_FMT = struct.Struct("<4xIf2H8H")
+# struct PktSample: magic[4] t_us platformDeg speed rawAngle dist[8] endAngle
+SAMPLE_FMT = struct.Struct("<4xIf2H8HH")
+LEGACY_SAMPLE_FMT = struct.Struct("<4xIf2H8H")
+# end_angle of a legacy sample. Below RAW_ANGLE_MIN, so no real angle is it.
+END_ANGLE_UNKNOWN = 0
 # struct PktTelem: magic[4] t_us platformDeg state reserved dropped
 TELEM_FMT = struct.Struct("<4xIf2BH")
 
@@ -244,6 +288,8 @@ TELEM_FMT = struct.Struct("<4xIf2BH")
 # walked off the end of its buffer. Assert it at import instead.
 for _name, _tag, _len, _fmt in (
         ("sample", SAMPLE_TAG, SAMPLE_LEN, SAMPLE_FMT),
+        ("legacy sample", LEGACY_SAMPLE_TAG, LEGACY_SAMPLE_LEN,
+         LEGACY_SAMPLE_FMT),
         ("telem", TELEM_TAG, TELEM_LEN, TELEM_FMT),
         ("config", CONFIG_TAG, CONFIG_LEN, CONFIG_FMT)):
     assert _tag == _len, f"{_name}: tag 0x{_tag:02X} != length {_len}"
@@ -291,6 +337,7 @@ _SAMPLE_COLS = {
     "speed": (2, None),
     "raw_angle": (3, None),
     "dist": (slice(4, 12), None),
+    "end_angle": (12, None),
 }
 _TELEM_COLS = {
     "t_us": (TEL_T_US, None),
@@ -342,7 +389,7 @@ class Capture:
     """Columnar store of everything decoded from a stream."""
 
     def __init__(self):
-        self.samples = []  # tuples straight out of SAMPLE_FMT
+        self.samples = []  # SAMPLE_FMT tuples (legacy ones padded to match)
         self.telem = []
         self.events = []
         # Latest config tuple the device reported.
@@ -429,8 +476,9 @@ class StreamParser:
                 break
             tag = buf[j + 3]
 
-            if tag == SAMPLE_TAG:
-                if j + SAMPLE_LEN > n:
+            if tag in (SAMPLE_TAG, LEGACY_SAMPLE_TAG):
+                rec_len = SAMPLE_LEN if tag == SAMPLE_TAG else LEGACY_SAMPLE_LEN
+                if j + rec_len > n:
                     i = j
                     break
                 # Nothing is lost by dropping here rather than at render time:
@@ -450,10 +498,14 @@ class StreamParser:
                     self.skipped += 1
                 else:
                     self._grace = False
-                    cap.samples.append(SAMPLE_FMT.unpack_from(buf, j))
+                    if tag == SAMPLE_TAG:
+                        rec = SAMPLE_FMT.unpack_from(buf, j)
+                    else:
+                        rec = LEGACY_SAMPLE_FMT.unpack_from(buf, j)                             + (END_ANGLE_UNKNOWN,)
+                    cap.samples.append(rec)
                     if self.on_sample:
                         self.on_sample(cap.samples[-1])
-                i = j + SAMPLE_LEN
+                i = j + rec_len
             elif tag == TELEM_TAG:
                 if j + TELEM_LEN > n:
                     i = j
@@ -548,8 +600,7 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
                 lidar_rotation=LIDAR_ROTATION_DEG,
                 lidar_reverse=LIDAR_REVERSE, flip_upright=FLIP_UPRIGHT,
                 emitter_spacing=EMITTER_SPACING_MM, half=SCAN_HALF_BOTH,
-                microstep_error=MICROSTEP_ERROR_DEG,
-                microstep_phase=MICROSTEP_ERROR_PHASE):
+                scan_tilt=SCAN_TILT_DEG, microstep=None):
     """Reconstruct the 3D point cloud.
 
     Returns (xyz, dist, platform_deg). Each sample carries the shaft angle it
@@ -560,27 +611,84 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
     `emitter_spacing` corrects the rangefinder's lateral standoff and `half`
     discards one side of each revolution; see the notes at the top of this
     module for what they are for and why they are two answers to one problem.
+    `scan_tilt` is the lean of the scan plane off the rotation axis.
+
+    `microstep` is the shaft-angle correction: None for the commanded angle as
+    is, coefficients from fit_microstep(), or "auto" to fit them to this capture
+    (cached on it, so only the first build after the capture changes pays).
+    """
+    p, good, platform_cmd, d = _mount_points(
+        cap, sweep_only, max_range, min_range, beam_offset, lidar_rotation,
+        lidar_reverse, emitter_spacing, half, scan_tilt)
+
+    if isinstance(microstep, str):
+        microstep = fit_microstep_cached(
+            cap, sweep_only=sweep_only, max_range=max_range,
+            min_range=min_range, beam_offset=beam_offset,
+            lidar_rotation=lidar_rotation, lidar_reverse=lidar_reverse,
+            emitter_spacing=emitter_spacing, scan_tilt=scan_tilt)
+
+    # Yaw about world Z by the shaft angle. No transpose ambiguity and no drift:
+    # this is the angle of a sensor rigidly bolted to the shaft that produced it.
+    # The one thing it is not is exact -- it is the angle the firmware
+    # *commanded*, and the rotor sits a little off it, periodically with the
+    # electrical cycle. See the microstep notes at the top of the module.
+    platform = correct_microstep(platform_cmd, microstep)
+    world = _yaw(p, platform)
+
+    # 180 deg about world X, after the pose. See FLIP_UPRIGHT.
+    if flip_upright:
+        world[..., 1] *= -1.0
+        world[..., 2] *= -1.0
+
+    g = good.ravel()
+    return (world.reshape(-1, 3)[g],
+            d.ravel()[g],
+            np.repeat(platform, POINTS)[g])
+
+
+def _yaw(p, platform_deg):
+    """(M, 8, 3) mount-frame points, (M,) shaft angles -> world frame."""
+    R = axis_angle_matrix(SPIN_AXIS, platform_deg)
+    return np.einsum("nij,nkj->nki", R, p)
+
+
+def _mount_points(cap, sweep_only, max_range, min_range, beam_offset,
+                  lidar_rotation, lidar_reverse, emitter_spacing, half,
+                  scan_tilt):
+    """Everything build_cloud does before the shaft rotation.
+
+    Returns (p, good, platform, dist): (M, 8, 3) points in the mount frame --
+    the frame of the shaft at angle 0 -- the (M, 8) mask of points worth
+    keeping, the (M,) commanded shaft angle of each frame and the (M, 8) ranges.
     """
     col = cap.arrays()
     n = len(cap)
     if n < 2:
         raise SystemExit(f"only {n} samples; capture a sweep first")
 
-    # Azimuth: a frame reports only its start angle, so its angular width is
-    # the gap to the next frame. Frames whose successor was dropped would smear
-    # their points over a bogus span, so they are discarded.
+    # Azimuth: the lidar reports the angles of a frame's first and last point,
+    # and the 8 points are evenly spaced between them (end - start is 7/8 of
+    # the gap to the next frame, to within 0.5 %). Legacy captures carry no end
+    # angle, so there the span falls back to 7/8 of the gap to the successor --
+    # and a frame whose successor was dropped, or that has none, is discarded
+    # rather than smeared over a bogus span.
     ang = to_degrees(col["raw_angle"])
-    step = np.mod(np.diff(ang), 360.0)
-    keep = (step > 0.0) & (step < 90.0)
+    end = col["end_angle"]
+    gap = np.append(np.mod(np.diff(ang), 360.0), np.nan)
+    width = np.where(end >= RAW_ANGLE_MIN,
+                     np.mod(to_degrees(end) - ang, 360.0),
+                     gap * (POINTS - 1) / POINTS)
+    keep = (width > 0.0) & (width < 90.0)
 
     if sweep_only:
-        keep &= _sweep_mask(cap, col)[:-1]
+        keep &= _sweep_mask(cap, col)
     if not keep.any():
         raise SystemExit("no usable frames in the sweep - was 's' sent?")
 
     k = np.flatnonzero(keep)
     # (M, 8) azimuth for every point, then flattened.
-    az = ang[k, None] + step[k, None] * (np.arange(POINTS) / POINTS)
+    az = ang[k, None] + width[k, None] * (np.arange(POINTS) / (POINTS - 1))
     d = col["dist"][k]
     valid = (d.astype(np.uint16) & DIST_INVALID) == 0
     d = (d.astype(np.uint16) & DIST_MASK).astype(np.float64)
@@ -618,30 +726,168 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
     # wrong is what splits a flat surface into two heights -- see the module
     # header.
     b = 0.5 * emitter_spacing
-    p = np.stack([d * sin_th + b * cos_th,
-                  np.full_like(d, beam_offset),
-                  d * cos_th - b * sin_th], axis=-1)
+    x = d * sin_th + b * cos_th
+    y = np.full_like(d, beam_offset)
+    z = d * cos_th - b * sin_th
 
-    # Yaw about world Z by the shaft angle. No transpose ambiguity and no drift:
-    # this is the angle of a sensor rigidly bolted to the shaft that produced it.
-    # The one thing it is not is exact -- it is the angle the firmware
-    # *commanded*, and the rotor sits a little off it, periodically with the full
-    # step. See MICROSTEP_ERROR_DEG; with the amplitude at zero this is the
-    # commanded angle unchanged.
-    platform = correct_microstep(col["platform"][k], microstep_error,
-                                 microstep_phase)
-    R = axis_angle_matrix(SPIN_AXIS, platform)
-    world = np.einsum("nij,nkj->nki", R, p)
+    # Lean the scan plane off the rotation axis: a rotation about the lidar's
+    # in-plane horizontal (X), before the shaft yaw. See SCAN_TILT_DEG.
+    if scan_tilt:
+        e = np.radians(scan_tilt)
+        y, z = np.cos(e) * y - np.sin(e) * z, np.sin(e) * y + np.cos(e) * z
 
-    # 180 deg about world X, after the pose. See FLIP_UPRIGHT.
-    if flip_upright:
-        world[..., 1] *= -1.0
-        world[..., 2] *= -1.0
+    return (np.stack([x, y, z], axis=-1), good, col["platform"][k], d)
 
-    g = good.ravel()
-    return (world.reshape(-1, 3)[g],
-            d.ravel()[g],
-            np.repeat(platform, POINTS)[g])
+
+# --- Microstep self-calibration ---------------------------------------------
+
+
+def fit_microstep(cap, harmonics=MICROSTEP_HARMONICS, iterations=2,
+                  patch_mm=120.0, **geometry):
+    """Measure the microstep error from the capture itself.
+
+    Returns coefficients for correct_microstep(). The cloud is cut into
+    patch_mm cubes; the flat ones are kept, and in each the offset of every
+    point from the patch's plane is regressed on g * basis(shaft angle), with
+    g = n . (zhat x P) the lever arm that turns an azimuth error into a
+    displacement along the normal (see the notes at the top of the module). A
+    patch mean is subtracted from both sides first, so a patch's own plane does
+    not soak up the fit. Re-fitting the planes with the correction applied and
+    repeating barely moves it: a second round is only a check.
+
+    `geometry` takes the build_cloud keywords that shape the cloud (anything but
+    `microstep` and `half`). Raises SystemExit if the capture has no sweep.
+    """
+    geometry.pop("microstep", None)
+    geometry.pop("flip_upright", None)
+    geometry.pop("half", None)
+    args = dict(sweep_only=True, max_range=None, min_range=60.0,
+                beam_offset=BEAM_OFFSET_MM, lidar_rotation=LIDAR_ROTATION_DEG,
+                lidar_reverse=LIDAR_REVERSE,
+                emitter_spacing=EMITTER_SPACING_MM, scan_tilt=SCAN_TILT_DEG)
+    args.update(geometry)
+    p, good, platform_cmd, _ = _mount_points(cap, half=SCAN_HALF_BOTH, **args)
+
+    coef = np.zeros(2 * harmonics)
+    g_flat = good.ravel()
+    plat_pt = np.repeat(platform_cmd, POINTS)[g_flat]
+    for _ in range(iterations):
+        P = _yaw(p, correct_microstep(platform_cmd, coef)).reshape(-1, 3)[g_flat]
+        rows, rhs = [], []
+        # Two grids half a cell apart, so a surface cut by one grid's cell
+        # boundary is whole in the other.
+        for shift in (0.0, 0.5 * patch_mm):
+            r, lever, plat, pid, uv = _flat_patch_residuals(
+                P, plat_pt, patch_mm, shift)
+            if not len(r):
+                continue
+            A = lever[:, None] * _microstep_basis(plat, harmonics)
+            # The patch's own plane is not the error: project an offset and a
+            # tilt per patch out of both sides. Without this the plane fit
+            # absorbs part of the ripple and each round recovers only ~70 %.
+            y = _project_out_plane(np.column_stack([r, A]), pid, uv)
+            rows.append(y[:, 1:])
+            rhs.append(y[:, 0])
+        if not rows:
+            break
+        A = np.concatenate(rows)
+        r = np.concatenate(rhs)
+        # One reweighting pass so the edges of objects and the odd stray point
+        # do not steer the fit.
+        sol = np.linalg.lstsq(A, r, rcond=None)[0]
+        w = 1.0 / np.maximum(1.0, np.abs(r - A @ sol) / 3.0)
+        sol = np.linalg.lstsq(A * w[:, None], r * w, rcond=None)[0]
+        # A point sitting at commanded angle + delta reads as -g * delta off its
+        # plane, hence the minus. sol is in radians of shaft angle.
+        step = -np.degrees(sol)
+        coef += step
+        if np.abs(step).max() < 1e-4:
+            break
+    return coef
+
+
+def _flat_patch_residuals(P, plat, size, shift, min_points=30, flat_mm=3.0,
+                          min_lever=150.0, max_resid=10.0):
+    """Per-point (residual, lever arm, shaft angle, patch id) for points in flat
+    patches of a size-mm grid. See fit_microstep."""
+    key = np.floor((P + shift) / size).astype(np.int64)
+    key = (key[:, 0] * 1000003 + key[:, 1]) * 1000003 + key[:, 2]
+    _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    m = len(cnt)
+    c = np.stack([np.bincount(inv, P[:, i], m) for i in range(3)], 1) \
+        / cnt[:, None]
+    C = np.empty((m, 3, 3))
+    for i in range(3):
+        for j in range(i, 3):
+            C[:, i, j] = C[:, j, i] = \
+                np.bincount(inv, P[:, i] * P[:, j], m) / cnt - c[:, i] * c[:, j]
+    w, vec = np.linalg.eigh(C)
+    n = vec[:, :, 0]
+    # Flat, and spread in two directions: a single scan line fits any plane
+    # through it and says nothing.
+    flat = (cnt >= min_points) & (w[:, 0] < flat_mm ** 2) \
+        & (w[:, 0] < 0.05 * w[:, 1]) & (w[:, 1] > (size / 6.0) ** 2)
+    keep = flat[inv]
+    pid = inv[keep]
+    rel = P[keep] - c[pid]
+    r = np.einsum("ij,ij->i", rel, n[pid])
+    Pk = P[keep]
+    lever = n[pid, 1] * Pk[:, 0] - n[pid, 0] * Pk[:, 1]   # n . (zhat x P)
+    # In-plane coordinates, scaled to the patch, for _project_out_plane.
+    uv = np.stack([np.einsum("ij,ij->i", rel, vec[pid, :, 1]),
+                   np.einsum("ij,ij->i", rel, vec[pid, :, 2])], 1) / size
+    ok = (np.abs(lever) > min_lever) & (np.abs(r) < max_resid)
+    _, pid = np.unique(pid[ok], return_inverse=True)
+    return r[ok], lever[ok], plat[keep][ok], pid.ravel(), uv[ok]
+
+
+def _project_out_plane(Y, pid, uv):
+    """Remove, per patch, the least-squares fit of a + b*u + c*v from every
+    column of Y (Frisch-Waugh: regressing the residuals on each other then
+    gives the answer a joint fit with a free plane per patch would)."""
+    m = pid.max() + 1
+    X = np.column_stack([np.ones(len(pid)), uv])            # (N, 3)
+    G = np.empty((m, 3, 3))
+    for i in range(3):
+        for j in range(i, 3):
+            G[:, i, j] = G[:, j, i] = np.bincount(pid, X[:, i] * X[:, j], m)
+    G += 1e-9 * np.eye(3)
+    B = np.stack([np.stack([np.bincount(pid, X[:, i] * Y[:, j], m)
+                            for j in range(Y.shape[1])], 1)
+                  for i in range(3)], 1)                   # (m, 3, cols)
+    coef = np.linalg.solve(G, B)                           # (m, 3, cols)
+    return Y - np.einsum("ni,nic->nc", X, coef[pid])
+
+
+def fit_microstep_cached(cap, **geometry):
+    """fit_microstep, remembered on the capture until it gains samples.
+
+    The mount geometry is deliberately not part of the key: it moves the
+    cloud, but the microstep error is a property of the motor and shows up the
+    same under any sensible mount settings, and refitting on every nudge of a
+    spinbox would make the knobs unusable.
+    """
+    # The live UI clears and refills one Capture per sweep, so the first
+    # timestamp is part of the key along with the length.
+    key = (len(cap), cap.samples[0][0] if len(cap) else None)
+    cached = getattr(cap, "_microstep_fit", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        coef = fit_microstep(cap, **geometry)
+    except SystemExit:
+        coef = None
+    cap._microstep_fit = (key, coef)
+    return coef
+
+
+def cached_microstep(cap):
+    """Whatever fit_microstep_cached last fitted on this capture, stale or not,
+    or None. For a sweep still arriving: refitting every tick is too slow, and
+    the error belongs to the motor, so the last fit is the best cheap guess."""
+    cached = getattr(cap, "_microstep_fit", None)
+    return None if cached is None else cached[1]
 
 
 def _sweep_mask(cap, col):

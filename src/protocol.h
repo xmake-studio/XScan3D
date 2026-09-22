@@ -19,7 +19,7 @@
 #define PKT_MAGIC1 0xAA
 #define PKT_MAGIC2 0x03
 
-#define PKT_SAMPLE_LEN 32
+#define PKT_SAMPLE_LEN 34  // was 32 before endAngle; the host still reads those
 #define PKT_TELEM_LEN  16
 #define PKT_CONFIG_LEN 20
 #define PKT_EVENT_TAG  0x09  // length is carried in the payload, not the tag
@@ -36,8 +36,10 @@ struct __attribute__((packed)) PktSample {
   uint32_t t_us;                       // micros() when the frame completed
   float    platformDeg;                // shaft angle, degrees about vertical
   uint16_t lidarSpeed;                 // lidar's own spin rate, 1/64 RPM
-  uint16_t rawAngle;                   // uncalibrated frame start angle
+  uint16_t rawAngle;                   // uncalibrated angle of point 0
   uint16_t dist[LIDAR_POINTS];         // raw words, bit 15 = no return
+  uint16_t endAngle;                   // uncalibrated angle of point 7, so a
+                                       // frame's span needs no neighbour
 };
 static_assert(sizeof(PktSample) == PKT_SAMPLE_LEN, "PktSample layout drifted");
 
@@ -95,6 +97,7 @@ static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
 #define CMD_STEPS  'n'  // "n60"    stepped: intervals across the sweep
 #define CMD_DWELL  'd'  // "d400"   stepped: lidar capture time per stop, ms
 #define CMD_UNWRAP 'u'  // "u90"    turn the shaft this far, then re-home
+#define CMD_BEEP   'b'  // play the scan-complete chime on the motor
 
 // Guard rails for the above, so a fat-fingered UI value cannot drive the
 // platform into its end stops or ask for a step rate the motor cannot hold.

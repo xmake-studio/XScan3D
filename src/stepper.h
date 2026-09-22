@@ -5,14 +5,14 @@
 // --- Wiring -----------------------------------------------------------------
 // A4988 soldered pin-side-down onto the RP2040 Zero, so the driver's pin order
 // maps straight onto consecutive GPIOs.
-#define STEP_PIN_ENABLE 1   // active LOW: LOW = coils energised
-#define STEP_PIN_MS1    2
-#define STEP_PIN_MS2    3
-#define STEP_PIN_MS3    4
-#define STEP_PIN_RESET  5   // active LOW: LOW = translator held at home state
-#define STEP_PIN_SLEEP  6   // active LOW: LOW = sleep
-#define STEP_PIN_STEP   7
-#define STEP_PIN_DIR    8
+#define STEP_PIN_ENABLE 8   // active LOW: LOW = coils energised
+#define STEP_PIN_MS1    9
+#define STEP_PIN_MS2    10
+#define STEP_PIN_MS3    11
+#define STEP_PIN_RESET  12  // active LOW: LOW = translator held at home state
+#define STEP_PIN_SLEEP  13  // active LOW: LOW = sleep
+#define STEP_PIN_STEP   14
+#define STEP_PIN_DIR    15
 
 // --- Motor ------------------------------------------------------------------
 #define STEP_FULL_STEPS_PER_REV 200   // 1.8 deg/step
@@ -116,6 +116,17 @@ class Stepper {
   // Emits one step in `forward`, ignoring the profile and the target. Blocks
   // for the pulse. Useful for jogging and homing.
   void stepOnce(bool forward);
+
+  // Uses the motor as a speaker: blocks for `ms`, swinging the rotor `swing`
+  // steps out and back at `freqHz`. The swing is the volume: more steps per
+  // swing is a bigger current excursion, and since those steps are spread
+  // evenly over the cycle the drive stays close to a sine rather than a click
+  // train. The swing ramps up over the first `fadeMs` and back down over the
+  // last, so the rotor is never kicked from rest. Every swing returns to where
+  // it started, so the position is unchanged. freqHz == 0 is a rest.
+  // Needs the coils enabled to make any sound.
+  void playTone(uint16_t freqHz, uint16_t ms, uint8_t swing = 1,
+                uint16_t fadeMs = 0);
 
  private:
   void applyMicrostepPins();

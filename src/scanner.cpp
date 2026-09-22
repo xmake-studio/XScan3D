@@ -124,6 +124,7 @@ void Scanner::serviceLidar() {
     s.platformDeg = platformDeg();
     s.lidarSpeed  = frame.speed;
     s.rawAngle    = frame.rawAngle;
+    s.endAngle    = frame.endAngle;
     for (uint8_t i = 0; i < LIDAR_POINTS; i++) {
       s.dist[i] = frame.points[i].valid ? frame.points[i].distance
                                         : LIDAR_DIST_INVALID;
@@ -174,6 +175,24 @@ void Scanner::engageMotor() {
     emitEvent("motor: re-energised, angle assumed unchanged at %+.2f deg",
               platformDeg());
   }
+}
+
+// --- Chime ------------------------------------------------------------------
+
+void Scanner::playChime() {
+  if (motor_.isRunning()) return;
+  engageMotor();
+
+  // Played at the scan's own 1/16 resolution, so there is no mode switch and
+  // the angle is safe wherever home happens to be.
+  //
+  // G5 then C6, a rising fourth: {Hz, ms, swing in microsteps}. The lower note
+  // gets the smaller swing to come out level with the higher one.
+  static const uint16_t notes[][3] = {
+      {784, 150, 3}, {0, 30, 0}, {1047, 250, 4},
+  };
+  for (const auto &n : notes)
+    motor_.playTone(n[0], n[1], (uint8_t)n[2], SCAN_CHIME_FADE_MS);
 }
 
 // --- Stepped mode -----------------------------------------------------------
@@ -331,13 +350,24 @@ void Scanner::runCommand(char cmd, const char *arg, bool hasArg) {
       break;
     }
 
+    case CMD_BEEP:
+      if (state_ != SCAN_IDLE) {
+        emitEvent("busy: cannot chime mid-sweep");
+        break;
+      }
+      playChime();
+      stateAt_ = millis();   // restart the idle-release countdown
+      break;
+
     case CMD_STATUS:
       nextTelem_ = millis();
       emitConfig();
-      emitEvent("state=%u platform=%+.2f deg motor=%s dropped=%u resync=%lu",
+      emitEvent("state=%u platform=%+.2f deg motor=%s dropped=%u resync=%lu "
+                "badcrc=%lu",
                 (unsigned)state_, platformDeg(),
                 motor_.isEnabled() ? "on" : "off", (unsigned)dropped_,
-                (unsigned long)lidarResyncBytes());
+                (unsigned long)lidarResyncBytes(),
+                (unsigned long)lidarChecksumErrors());
       break;
 
     default:
@@ -459,6 +489,9 @@ void Scanner::advanceStateMachine() {
 
     case SCAN_DONE:
       if (!motor_.isRunning()) {
+#if SCAN_CHIME_ENABLED
+        playChime();
+#endif
         state_   = SCAN_IDLE;
         stateAt_ = millis();   // also starts the idle-release countdown
         emitEvent("idle");

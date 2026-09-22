@@ -238,3 +238,46 @@ class RegisterWorker(QtCore.QThread):
             self.failed.emit(str(exc))
             return
         self.done.emit(result)
+
+
+# --- Mount calibration worker -----------------------------------------------
+
+class CalibrateWorker(QtCore.QThread):
+    """Fits the mount geometry to one capture off the GUI thread.
+
+    A few minutes of scoring trial geometries. It reads only its own copy of
+    the sample list, so the scene can keep changing underneath it.
+    """
+
+    progress = QtCore.pyqtSignal(str, float)
+    done = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, cap, rotation, spacing, tilt, reverse, parent=None):
+        super().__init__(parent)
+        # Snapshot: a live capture keeps appending, and the fit wants one sweep.
+        self.cap = sp.Capture()
+        self.cap.samples = list(cap.samples)
+        self.cap.telem = list(cap.telem)
+        self.cap.config = cap.config
+        self.start_values = (rotation, spacing, tilt)
+        self.reverse = reverse
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        import calibrate_mount as cm
+        try:
+            result = cm.calibrate(self.cap, *self.start_values,
+                                  reverse=self.reverse,
+                                  progress=self.progress.emit,
+                                  cancelled=lambda: self._cancel)
+        except cm.Cancelled:
+            self.failed.emit("cancelled")
+            return
+        except Exception as exc:                       # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+        self.done.emit(result)

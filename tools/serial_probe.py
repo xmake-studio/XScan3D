@@ -46,6 +46,8 @@ def classify(buf):
         tag = buf[j + 3]
         if tag == sp.SAMPLE_TAG:
             counts["sample"] += 1; i = j + sp.SAMPLE_LEN
+        elif tag == sp.LEGACY_SAMPLE_TAG:
+            counts["sample"] += 1; i = j + sp.LEGACY_SAMPLE_LEN
         elif tag == sp.TELEM_TAG:
             counts["telem"] += 1; i = j + sp.TELEM_LEN
         elif tag == sp.CONFIG_TAG:
@@ -113,7 +115,7 @@ def probe(port, baud, dtr, seconds, send):
                   f"dropped={int(t[sp.TEL_DROPPED])}")
         if not cap.samples:
             print("\n  No lidar samples -- telemetry works but the lidar UART")
-            print("  is quiet. Check the lidar's power and its TX -> GPIO13.")
+            print("  is quiet. Check the lidar's power and its TX -> GPIO5.")
 
         if send:
             print(f"\nsending '{send}' ...")
