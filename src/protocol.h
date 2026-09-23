@@ -84,10 +84,40 @@ static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
 // Human-readable notices: magic, uint8 length, then that many ASCII bytes.
 #define PKT_EVENT_MAX 96
 
+// --- Calibration ------------------------------------------------------------
+// The rig's calibration -- how the lidar sits on the shaft, the scan-plane
+// tilt, the range model -- lives in the scanner's own flash, so it travels
+// with the hardware instead of with whichever PC fitted it. The firmware never
+// looks inside: to it the calibration is an opaque blob (the host stores JSON)
+// guarded by a CRC-32, written with CMD_CALIB_WRITE and read back with
+// CMD_CALIB_READ.
+//
+// The blob goes out as a series of chunk records, each carrying the whole
+// blob's length and CRC so the host can assemble them and check the result.
+// A device with nothing stored answers with one record of total 0. Chunks are
+// only emitted while the platform is idle, so they never compete with the
+// sample stream of a sweep for the USB pipe.
+#define PKT_CALIB_TAG   0x0C  // variable length, like events
+#define PKT_CALIB_CHUNK 64    // payload bytes per record at most
+#define CALIB_MAX_LEN   2048  // the blob, not counting the flash header
+
+struct __attribute__((packed)) PktCalibHdr {
+  uint8_t  magic[4];
+  uint16_t total;                      // blob length; 0 = nothing stored
+  uint16_t offset;                     // where this chunk's payload goes
+  uint32_t crc;                        // CRC-32 (IEEE) of the whole blob
+  uint8_t  n;                          // payload bytes following this header
+};
+static_assert(sizeof(PktCalibHdr) == 13, "PktCalibHdr layout drifted");
+
+// A write that stops arriving mid-blob is abandoned after this long, so a host
+// that died halfway cannot leave the command parser swallowing bytes forever.
+#define CALIB_RX_TIMEOUT_MS 1000
+
 // --- Host -> MCU commands ---------------------------------------------------
 // Line oriented: one command letter, an optional decimal argument, then a
 // newline. A bare letter still works when typed into a serial monitor.
-#define CMD_START  's'  // park, settle, then sweep
+#define CMD_START  's'  // find the end stop, park, settle, then sweep
 #define CMD_ABORT  'x'  // stop where you are, go idle
 #define CMD_HOME   'h'  // call the current shaft angle zero
 #define CMD_STATUS '?'  // emit telemetry + config + a text event
@@ -98,6 +128,13 @@ static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
 #define CMD_DWELL  'd'  // "d400"   stepped: lidar capture time per stop, ms
 #define CMD_UNWRAP 'u'  // "u90"    turn the shaft this far, then re-home
 #define CMD_BEEP   'b'  // play the scan-complete chime on the motor
+#define CMD_CALIB_READ  'c'  // emit the calibration stored in flash
+// "w<len>,<crc>" then exactly <len> raw bytes: store them as the calibration.
+// The raw bytes bypass the line parser entirely, so they may hold anything.
+// Refused (but still consumed) mid-sweep or on a CRC mismatch; either way the
+// device answers with whatever it now holds, which is the host's confirmation.
+// "w0,0" erases the stored calibration.
+#define CMD_CALIB_WRITE 'w'
 
 // Guard rails for the above, so a fat-fingered UI value cannot drive the
 // platform into its end stops or ask for a step rate the motor cannot hold.
@@ -113,6 +150,12 @@ static_assert(sizeof(PktConfig) == PKT_CONFIG_LEN, "PktConfig layout drifted");
 // Half a plane is a pole-to-pole arc rather than a full circle, so it needs the
 // whole turn to sweep the sphere. Past that nothing new is scanned and the
 // tether only takes on more twist.
+//
+// With the end stop fitted, the real ceiling is the stop's free travel less
+// SCAN_HOME_BACKOFF and up to one electrical cycle (see scanner.h): a sweep
+// wider than that runs into the stop from the other side. The host's automatic
+// sweep is a little over 90 -- enough to close the seam the scan-plane tilt
+// opens -- which leaves plenty of room.
 #define SCAN_DEGREES_MIN 1.0f
 #define SCAN_DEGREES_MAX 180.0f
 #define SCAN_TIME_MIN    2.0f

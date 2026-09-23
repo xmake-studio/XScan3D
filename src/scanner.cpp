@@ -3,6 +3,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "calib_store.h"
 #include "lidar_parser.h"
 #include "protocol.h"
 
@@ -54,7 +55,7 @@ void Scanner::begin() {
   emitEvent("boot: scanner starting");
 
   statusLed.begin();
-  statusLed.setBrightness(32);
+  statusLed.setBrightness(255);
   setStatus(255, 0, 255);  // magenta: booting
 
   // The motor claims its pins first, so nothing else can take them later.
@@ -70,6 +71,12 @@ void Scanner::begin() {
 
   lidarBegin();
   emitEvent("boot: lidar uart on RX%d/TX%d", LIDAR_RX_PIN, LIDAR_TX_PIN);
+
+  calib::begin();
+  if (calib::length())
+    emitEvent("boot: calibration in flash, %u bytes", (unsigned)calib::length());
+  else
+    emitEvent("boot: no calibration in flash");
 
   nextTelem_ = millis();
   state_     = SCAN_IDLE;
@@ -201,11 +208,9 @@ void Scanner::advanceStep() {
   if (stepIndex_ >= steps_) {
     emitEvent("stepped scan complete: %u stops, dropped=%u",
               (unsigned)(steps_ + 1), (unsigned)dropped_);
+    // Stays at the far end, as a continuous sweep does (see SCAN_SWEEPING).
     state_   = SCAN_DONE;
     stateAt_ = millis();
-    motor_.setMaxSpeed(SCAN_TRAVEL_SPEED);
-    motor_.setAcceleration(SCAN_TRAVEL_ACCEL);
-    motor_.moveTo(0);
     return;
   }
 
@@ -239,12 +244,101 @@ void Scanner::emitConfig() {
   Serial.write((const uint8_t *)&c, sizeof(c));
 }
 
+// --- Calibration ------------------------------------------------------------
+
+// One chunk per call, and only while idle: a sweep's samples own the pipe, and
+// a chunk that does not fit now simply goes out on a later pass.
+void Scanner::serviceCalibTx() {
+  if (!txPending_) return;
+  if (state_ != SCAN_IDLE && state_ != SCAN_DONE) return;
+
+  const uint16_t total = calib::length();
+  if (txOff_ > total) txOff_ = 0;   // the blob shrank under a transfer
+  const uint16_t n = min<uint16_t>(PKT_CALIB_CHUNK, total - txOff_);
+  if ((size_t)Serial.availableForWrite() < sizeof(PktCalibHdr) + n) return;
+
+  PktCalibHdr h;
+  putMagic(h.magic, PKT_CALIB_TAG);
+  h.total  = total;
+  h.offset = txOff_;
+  h.crc    = calib::crc();
+  h.n      = (uint8_t)n;
+  Serial.write((const uint8_t *)&h, sizeof(h));
+  if (n) Serial.write(calib::data() + txOff_, n);
+  txOff_ += n;
+  if (txOff_ >= total) txPending_ = false;
+}
+
+void Scanner::beginCalibWrite(const char *arg, bool hasArg) {
+  // Without a well-formed length the bytes that follow cannot be told apart
+  // from commands, so this is the one refusal that cannot consume them. The
+  // host always sends the length.
+  char *end = nullptr;
+  const unsigned long len = hasArg ? strtoul(arg, &end, 10) : 0;
+  if (!hasArg || !end || *end != ',') {
+    emitEvent("calib: write needs w<len>,<crc>");
+    return;
+  }
+  rxLen_     = (uint16_t)min<unsigned long>(len, 0xFFFF);
+  rxCrc_     = strtoul(end + 1, nullptr, 10);
+  rxGot_     = 0;
+  rxDiscard_ = len > CALIB_MAX_LEN;
+  rxAt_      = millis();
+  rxActive_  = true;
+  if (rxLen_ == 0) finishCalibWrite();
+}
+
+void Scanner::serviceCalibRx() {
+  if (rxActive_ && millis() - rxAt_ > CALIB_RX_TIMEOUT_MS) {
+    rxActive_ = false;
+    emitEvent("calib: write timed out after %u of %u bytes",
+              (unsigned)rxGot_, (unsigned)rxLen_);
+  }
+}
+
+void Scanner::finishCalibWrite() {
+  rxActive_ = false;
+  if (rxDiscard_) {
+    emitEvent("calib: %u bytes is over the %d byte limit, not saved",
+              (unsigned)rxLen_, CALIB_MAX_LEN);
+  } else if (rxLen_ && calib::crc32(calibRx_, rxLen_) != rxCrc_) {
+    emitEvent("calib: bad crc, not saved");
+  } else if (state_ != SCAN_IDLE || motor_.isRunning()) {
+    // The flash write stops the world for tens of milliseconds, which a
+    // moving motor would feel as a dent in its step train.
+    emitEvent("calib: not saved, platform busy");
+  } else {
+    bool changed = false;
+    if (!calib::store(calibRx_, rxLen_, &changed))
+      emitEvent("calib: flash write failed");
+    else if (!rxLen_)
+      emitEvent("calib: erased");
+    else
+      emitEvent(changed ? "calib: saved %u bytes" : "calib: unchanged, %u bytes",
+                (unsigned)rxLen_);
+    stateAt_ = millis();   // restart the idle-release countdown
+  }
+  // Whatever happened, answer with what the flash now holds.
+  txOff_     = 0;
+  txPending_ = true;
+}
+
 // Accumulates a line, then dispatches. A lone command letter with no newline
 // still fires as soon as the next letter arrives, so a serial monitor works.
 void Scanner::handleCommands() {
   while (Serial.available()) {
     int c = Serial.read();
     if (c < 0) break;
+
+    // Raw calibration bytes are counted off before any line parsing: they may
+    // hold anything, including letters that would otherwise run as commands.
+    if (rxActive_) {
+      if (!rxDiscard_) calibRx_[rxGot_] = (uint8_t)c;
+      rxGot_++;
+      rxAt_ = millis();
+      if (rxGot_ >= rxLen_) finishCalibWrite();
+      continue;
+    }
 
     if (c == '\r' || c == '\n') {
       if (lineLen_ > 0) {
@@ -359,6 +453,15 @@ void Scanner::runCommand(char cmd, const char *arg, bool hasArg) {
       stateAt_ = millis();   // restart the idle-release countdown
       break;
 
+    case CMD_CALIB_READ:
+      txOff_     = 0;
+      txPending_ = true;
+      break;
+
+    case CMD_CALIB_WRITE:
+      beginCalibWrite(arg, hasArg);
+      break;
+
     case CMD_STATUS:
       nextTelem_ = millis();
       emitConfig();
@@ -391,12 +494,16 @@ void Scanner::startScan() {
   stepIndex_ = 0;
   emitConfig();  // pin the geometry this scan was taken with into the stream
   engageMotor();
-  motor_.setMaxSpeed(SCAN_TRAVEL_SPEED);
+  // Far enough to reach the stop even from the far end of a sweep that was
+  // aborted there, however wide the sweep has been set.
+  const float travel =
+      max(SCAN_HOME_DEG, 2.0f * scanDegrees_ + SCAN_HOME_BACKOFF + 15.0f);
+  motor_.setMaxSpeed(SCAN_HOME_SPEED);
   motor_.setAcceleration(SCAN_TRAVEL_ACCEL);
-  motor_.moveTo(platformDegToSteps(-scanDegrees_));
-  state_   = SCAN_PARKING;
+  motor_.move(-platformDegToSteps(travel));
+  state_   = SCAN_HOMING;
   stateAt_ = millis();
-  emitEvent("parking to %+.1f deg", -scanDegrees_);
+  emitEvent("homing: driving %.0f deg into the end stop", travel);
   if (scanMode_ == SCAN_MODE_STEPPED) {
     // The runtime is set by the dwell windows, not by scanTime_, so state it
     // up front rather than letting the operator infer it from the duration
@@ -440,6 +547,33 @@ void Scanner::abort(const char *why) {
 
 void Scanner::advanceStateMachine() {
   switch (state_) {
+    case SCAN_HOMING:
+      if (!motor_.isRunning()) {
+        // The field now sits within half an electrical cycle of the stop.
+        // Renumber so that backing off by at least SCAN_HOME_BACKOFF lands on
+        // -scanDegrees_, shifting the count only by whole electrical cycles:
+        // the driver's current table is indexed by the step count, and keeping
+        // count and phase in step keeps the microstep error a fixed function
+        // of the reported angle from one scan to the next.
+        const long cycle = 4L * motor_.stepsPerRev() / STEP_FULL_STEPS_PER_REV;
+        const long start = platformDegToSteps(-scanDegrees_);
+        const long want  = start - platformDegToSteps(SCAN_HOME_BACKOFF);
+        const long pos   = motor_.currentPosition();
+        long k = (want - pos) / cycle;
+        if (pos + k * cycle > want) k--;   // round toward the stop
+        motor_.setCurrentPosition(pos + k * cycle);
+        motor_.setMaxSpeed(SCAN_TRAVEL_SPEED);
+        motor_.setAcceleration(SCAN_TRAVEL_ACCEL);
+        motor_.moveTo(start);
+        state_   = SCAN_PARKING;
+        stateAt_ = millis();
+        emitEvent("end stop reached; backing off %.1f deg to %+.1f deg",
+                  360.0f * (start - motor_.currentPosition()) /
+                      motor_.stepsPerRev(),
+                  -scanDegrees_);
+      }
+      break;
+
     case SCAN_PARKING:
       if (!motor_.isRunning()) {
         state_   = SCAN_SETTLING;
@@ -479,11 +613,11 @@ void Scanner::advanceStateMachine() {
       if (!motor_.isRunning()) {
         emitEvent("sweep complete in %.1f s, dropped=%u",
                   (millis() - stateAt_) / 1000.0f, (unsigned)dropped_);
+        // Stays at the far end instead of returning to the middle: the next
+        // scan's homing then covers most of its travel in free air and only
+        // grinds against the stop for the last few degrees.
         state_   = SCAN_DONE;
         stateAt_ = millis();
-        motor_.setMaxSpeed(SCAN_TRAVEL_SPEED);
-        motor_.setAcceleration(SCAN_TRAVEL_ACCEL);
-        motor_.moveTo(0);
       }
       break;
 
@@ -535,8 +669,10 @@ void Scanner::advanceStateMachine() {
 void Scanner::update() {
   motor_.run();
   handleCommands();
+  serviceCalibRx();
   serviceLidar();
   serviceTelemetry();
+  serviceCalibTx();
   advanceStateMachine();
   serviceIdlePower();
 }

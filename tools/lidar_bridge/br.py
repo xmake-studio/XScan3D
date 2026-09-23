@@ -1,7 +1,7 @@
 import serial, struct, time
 HDR = b'\x55\xAA\x02\x08'
 class Br:
-    def __init__(s, port='COM4'):
+    def __init__(s, port):  # e.g. 'COM4' or '/dev/ttyACM0'
         s.s = serial.Serial(port, 115200, timeout=0.05); s.s.dtr = True
         time.sleep(0.2); s.s.reset_input_buffer()
     def cmd(s, c, a=0, wait=0.3):

@@ -25,6 +25,10 @@ LEGACY_SAMPLE_TAG, LEGACY_SAMPLE_LEN = 0x20, 32
 TELEM_TAG, TELEM_LEN = 0x10, 16
 CONFIG_TAG, CONFIG_LEN = 0x14, 20
 EVENT_TAG = 0x09
+# A chunk of the calibration blob kept in the scanner's flash: header of
+# total u16, offset u16, crc u32, n u8, then n bytes. Only the app reads it;
+# here it is skipped whole so its payload is never mistaken for records.
+CALIB_TAG, CALIB_HDR_LEN = 0x0C, 13
 # scanDegrees scanTime | mode reserved steps settleMs captureMs -- the
 # stepped-mode fields are zero in a continuous scan.
 CONFIG_FMT = struct.Struct("<4x2f2B3H")
@@ -229,6 +233,74 @@ def correct_microstep(platform_deg, coef):
     coef = np.asarray(coef, dtype=np.float64)
     return th + _microstep_basis(th.ravel(), len(coef) // 2).dot(
         coef).reshape(th.shape)
+
+# --- Range non-linearity ------------------------------------------------------
+#
+# The lidar is a triangulation rangefinder: it finds where the laser spot lands
+# on its image sensor, and the range is inversely proportional to that
+# position. The spot centre is found to a fraction of a pixel, and that
+# sub-pixel interpolation has a systematic error that repeats every pixel. So
+# the range error is periodic -- not in the range d, but in 1/d, which is what
+# the pixel position is proportional to -- and a fixed error in pixels becomes
+# an error in range that grows at least as d^2 (faster in practice: the spot
+# also gets fainter and wider with distance, so its centre is found worse):
+#
+#     error(d) = (d / 1 m)^p * sum_k a_k(d) cos(2 pi k u / T)
+#                                   + b_k(d) sin(2 pi k u / T)
+#     u = 1e6 / d        (d in mm, so u is in 1/km)
+#
+# a_k and b_k are allowed to drift slowly -- linearly -- with range: the
+# lens maps the spot onto the sensor not quite linearly in 1/d, so over a few
+# metres the ripple both grows and slides in phase.
+#
+# On a flat surface it reads as ripples at constant range from the sensor --
+# concentric rings on a ceiling, spreading and deepening outwards: on this
+# lidar a few millimetres at 2-3 m and well over a centimetre at 4 m, one
+# ripple per 10 cm of range at 2 m and per 40 cm at 4 m. It belongs to the lidar
+# itself, so unlike the microstep error it is calibrated once (Mount geometry
+# -> Calibrate from scan) and kept.
+#
+# The growth and drift are only known over the ranges the calibration scan
+# covered, and extrapolating a d^3 polynomial is how a 4 mm ripple becomes a
+# 40 mm one. So outside that span both are frozen at its edge: the ripple keeps
+# its phase but stops growing.
+#
+# RANGE_ERROR is (T, p, E, d_lo, d_hi, coefficients...): E the number of drift
+# terms (see _range_basis), d_lo..d_hi the calibrated span in mm. None
+# disables the correction. Fitted to scans/room.bin.
+RANGE_ERROR = (24.7, 3.5, 2, 827, 3561,
+               -0.08861, -0.01755, -0.003573, 0.1086, -0.01447, 0.01174,
+               -0.1113, 0.01858, -0.003672, 0.0393, 0.06772, 0.01801)
+RANGE_HARMONICS = 3
+RANGE_DRIFT_TERMS = 2
+
+
+def _range_basis(d, period, power, harmonics, drift=1, span=None):
+    """(N,) ranges in mm -> (N, 2*harmonics*drift) columns of the model above:
+    for each drift term j (a factor (d/1 m - 3)^j), cos then sin columns. The
+    envelope and drift are evaluated at d clipped to `span` (lo, hi)."""
+    d = np.asarray(d, dtype=np.float64)
+    w = (2.0 * np.pi / period) * (1e6 / np.maximum(d, 1.0))[:, None]         * np.arange(1, harmonics + 1)
+    de = d if span is None else np.clip(d, span[0], span[1])
+    s = ((de / 1000.0) ** power)[:, None]
+    cs = np.concatenate([s * np.cos(w), s * np.sin(w)], axis=1)
+    x = (de / 1000.0 - 3.0)[:, None]
+    return np.concatenate([cs * x ** j for j in range(drift)], axis=1)
+
+
+def correct_range(d, range_error):
+    """Measured range(s) in mm -> corrected. `range_error` as RANGE_ERROR."""
+    d = np.asarray(d, dtype=np.float64)
+    if range_error is None or len(range_error) < 7:
+        return d
+    period, power = float(range_error[0]), float(range_error[1])
+    drift = int(range_error[2])
+    span = (float(range_error[3]), float(range_error[4]))
+    coef = np.asarray(range_error[5:], dtype=np.float64)
+    flat = d.ravel()
+    return (flat - _range_basis(flat, period, power, len(coef) // (2 * drift),
+                                drift, span) @ coef).reshape(d.shape)
+
 
 # Rotation of the lidar about its own spin axis, in degrees clockwise (the same
 # sense the azimuth below runs in).
@@ -535,6 +607,15 @@ class StreamParser:
                 if self.echo_events:
                     print(f"[mcu] {text}", file=sys.stderr)
                 i = j + 5 + ln
+            elif tag == CALIB_TAG:
+                if j + CALIB_HDR_LEN > n:
+                    i = j
+                    break
+                ln = buf[j + 12]
+                if j + CALIB_HDR_LEN + ln > n:
+                    i = j
+                    break
+                i = j + CALIB_HDR_LEN + ln
             else:
                 # Not one of ours; the magic was a coincidence in the payload.
                 self.junk += 1
@@ -600,7 +681,8 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
                 lidar_rotation=LIDAR_ROTATION_DEG,
                 lidar_reverse=LIDAR_REVERSE, flip_upright=FLIP_UPRIGHT,
                 emitter_spacing=EMITTER_SPACING_MM, half=SCAN_HALF_BOTH,
-                scan_tilt=SCAN_TILT_DEG, microstep=None):
+                scan_tilt=SCAN_TILT_DEG, microstep=None,
+                range_error=RANGE_ERROR):
     """Reconstruct the 3D point cloud.
 
     Returns (xyz, dist, platform_deg). Each sample carries the shaft angle it
@@ -616,17 +698,20 @@ def build_cloud(cap, sweep_only=True, max_range=None, min_range=60.0,
     `microstep` is the shaft-angle correction: None for the commanded angle as
     is, coefficients from fit_microstep(), or "auto" to fit them to this capture
     (cached on it, so only the first build after the capture changes pays).
+    `range_error` corrects the lidar's own range non-linearity; see
+    RANGE_ERROR.
     """
     p, good, platform_cmd, d = _mount_points(
         cap, sweep_only, max_range, min_range, beam_offset, lidar_rotation,
-        lidar_reverse, emitter_spacing, half, scan_tilt)
+        lidar_reverse, emitter_spacing, half, scan_tilt, range_error)
 
     if isinstance(microstep, str):
         microstep = fit_microstep_cached(
             cap, sweep_only=sweep_only, max_range=max_range,
             min_range=min_range, beam_offset=beam_offset,
             lidar_rotation=lidar_rotation, lidar_reverse=lidar_reverse,
-            emitter_spacing=emitter_spacing, scan_tilt=scan_tilt)
+            emitter_spacing=emitter_spacing, scan_tilt=scan_tilt,
+            range_error=range_error)
 
     # Yaw about world Z by the shaft angle. No transpose ambiguity and no drift:
     # this is the angle of a sensor rigidly bolted to the shaft that produced it.
@@ -655,7 +740,7 @@ def _yaw(p, platform_deg):
 
 def _mount_points(cap, sweep_only, max_range, min_range, beam_offset,
                   lidar_rotation, lidar_reverse, emitter_spacing, half,
-                  scan_tilt):
+                  scan_tilt, range_error=None):
     """Everything build_cloud does before the shaft rotation.
 
     Returns (p, good, platform, dist): (M, 8, 3) points in the mount frame --
@@ -692,6 +777,8 @@ def _mount_points(cap, sweep_only, max_range, min_range, beam_offset,
     d = col["dist"][k]
     valid = (d.astype(np.uint16) & DIST_INVALID) == 0
     d = (d.astype(np.uint16) & DIST_MASK).astype(np.float64)
+    # The lidar's own range non-linearity, before anything uses the range.
+    d = correct_range(d, range_error)
 
     good = valid & (d > min_range)
     if max_range is not None:
@@ -764,7 +851,8 @@ def fit_microstep(cap, harmonics=MICROSTEP_HARMONICS, iterations=2,
     args = dict(sweep_only=True, max_range=None, min_range=60.0,
                 beam_offset=BEAM_OFFSET_MM, lidar_rotation=LIDAR_ROTATION_DEG,
                 lidar_reverse=LIDAR_REVERSE,
-                emitter_spacing=EMITTER_SPACING_MM, scan_tilt=SCAN_TILT_DEG)
+                emitter_spacing=EMITTER_SPACING_MM, scan_tilt=SCAN_TILT_DEG,
+                range_error=RANGE_ERROR)
     args.update(geometry)
     p, good, platform_cmd, _ = _mount_points(cap, half=SCAN_HALF_BOTH, **args)
 
@@ -777,11 +865,16 @@ def fit_microstep(cap, harmonics=MICROSTEP_HARMONICS, iterations=2,
         # Two grids half a cell apart, so a surface cut by one grid's cell
         # boundary is whole in the other.
         for shift in (0.0, 0.5 * patch_mm):
-            r, lever, plat, pid, uv = _flat_patch_residuals(
-                P, plat_pt, patch_mm, shift)
-            if not len(r):
+            idx, r, n, pid, uv = _flat_patches(P, patch_mm, shift)
+            # n . (zhat x P): how far an azimuth error moves a point off its
+            # plane. Near zero it carries no information, only noise.
+            lever = n[:, 1] * P[idx, 0] - n[:, 0] * P[idx, 1]
+            ok = np.abs(lever) > 150.0
+            if not ok.any():
                 continue
-            A = lever[:, None] * _microstep_basis(plat, harmonics)
+            r, lever, uv = r[ok], lever[ok], uv[ok]
+            pid = _refit(pid, ok)
+            A = lever[:, None] * _microstep_basis(plat_pt[idx[ok]], harmonics)
             # The patch's own plane is not the error: project an offset and a
             # tilt per patch out of both sides. Without this the plane fit
             # absorbs part of the ripple and each round recovers only ~70 %.
@@ -806,40 +899,44 @@ def fit_microstep(cap, harmonics=MICROSTEP_HARMONICS, iterations=2,
     return coef
 
 
-def _flat_patch_residuals(P, plat, size, shift, min_points=30, flat_mm=3.0,
-                          min_lever=150.0, max_resid=10.0):
-    """Per-point (residual, lever arm, shaft angle, patch id) for points in flat
-    patches of a size-mm grid. See fit_microstep."""
+def _flat_patches(P, size, shift, min_points=30, flat_mm=3.0,
+                  max_resid=10.0):
+    """Points of P that lie in flat patches of a size-mm grid.
+
+    Returns (idx, r, n, pid, uv): indices into P, each point's offset from its
+    patch's plane, the patch normal per point, a dense patch id, and in-plane
+    coordinates scaled to the patch (for _project_out_plane). Points further
+    than max_resid from their plane are left out."""
     key = np.floor((P + shift) / size).astype(np.int64)
     key = (key[:, 0] * 1000003 + key[:, 1]) * 1000003 + key[:, 2]
     _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
     inv = inv.ravel()
     m = len(cnt)
-    c = np.stack([np.bincount(inv, P[:, i], m) for i in range(3)], 1) \
-        / cnt[:, None]
+    c = np.stack([np.bincount(inv, P[:, i], m) for i in range(3)], 1)         / cnt[:, None]
     C = np.empty((m, 3, 3))
     for i in range(3):
         for j in range(i, 3):
-            C[:, i, j] = C[:, j, i] = \
-                np.bincount(inv, P[:, i] * P[:, j], m) / cnt - c[:, i] * c[:, j]
+            C[:, i, j] = C[:, j, i] =                 np.bincount(inv, P[:, i] * P[:, j], m) / cnt - c[:, i] * c[:, j]
     w, vec = np.linalg.eigh(C)
-    n = vec[:, :, 0]
     # Flat, and spread in two directions: a single scan line fits any plane
     # through it and says nothing.
-    flat = (cnt >= min_points) & (w[:, 0] < flat_mm ** 2) \
-        & (w[:, 0] < 0.05 * w[:, 1]) & (w[:, 1] > (size / 6.0) ** 2)
-    keep = flat[inv]
-    pid = inv[keep]
-    rel = P[keep] - c[pid]
-    r = np.einsum("ij,ij->i", rel, n[pid])
-    Pk = P[keep]
-    lever = n[pid, 1] * Pk[:, 0] - n[pid, 0] * Pk[:, 1]   # n . (zhat x P)
-    # In-plane coordinates, scaled to the patch, for _project_out_plane.
+    flat = (cnt >= min_points) & (w[:, 0] < flat_mm ** 2)         & (w[:, 0] < 0.05 * w[:, 1]) & (w[:, 1] > (size / 6.0) ** 2)
+    idx = np.flatnonzero(flat[inv])
+    pid = inv[idx]
+    rel = P[idx] - c[pid]
+    n = vec[pid, :, 0]
+    r = np.einsum("ij,ij->i", rel, n)
     uv = np.stack([np.einsum("ij,ij->i", rel, vec[pid, :, 1]),
                    np.einsum("ij,ij->i", rel, vec[pid, :, 2])], 1) / size
-    ok = (np.abs(lever) > min_lever) & (np.abs(r) < max_resid)
+    ok = np.abs(r) < max_resid
     _, pid = np.unique(pid[ok], return_inverse=True)
-    return r[ok], lever[ok], plat[keep][ok], pid.ravel(), uv[ok]
+    return idx[ok], r[ok], n[ok], pid.ravel(), uv[ok]
+
+
+def _refit(pid, keep):
+    """Dense patch ids for the subset `keep` of points."""
+    _, out = np.unique(pid[keep], return_inverse=True)
+    return out.ravel()
 
 
 def _project_out_plane(Y, pid, uv):
@@ -858,6 +955,112 @@ def _project_out_plane(Y, pid, uv):
                   for i in range(3)], 1)                   # (m, 3, cols)
     coef = np.linalg.solve(G, B)                           # (m, 3, cols)
     return Y - np.einsum("ni,nic->nc", X, coef[pid])
+
+
+# --- Range self-calibration -------------------------------------------------
+
+
+def fit_range_error(cap, microstep=None, harmonics=RANGE_HARMONICS,
+                    drift=RANGE_DRIFT_TERMS, periods=(15.0, 40.0),
+                    patch_mm=200.0, iterations=2, **geometry):
+    """Measure the lidar's range non-linearity (see RANGE_ERROR) from a scan.
+
+    Every flat patch is a ruler along its own normal: a range error of e moves
+    a point by e * cos(incidence) off the patch's plane. The model's period is
+    searched over `periods` (1/km), then the harmonics are solved by least
+    squares, with each patch's own plane projected out as in fit_microstep.
+
+    Returns a RANGE_ERROR tuple, or None when the scan does not show the error
+    clearly enough to be worth correcting -- too little flat surface far enough
+    away for it to be measurable.
+    """
+    for key in ("microstep", "flip_upright", "half", "range_error"):
+        geometry.pop(key, None)
+    total = None
+    for rnd in range(iterations):
+        P, d, _ = build_cloud(cap, microstep=microstep, range_error=total,
+                              **geometry)
+        rows = []
+        for shift in (0.0, 0.5 * patch_mm):
+            idx, r, n, pid, uv = _flat_patches(P, patch_mm, shift, flat_mm=6.0,
+                                               max_resid=15.0)
+            beam = P[idx] / np.linalg.norm(P[idx], axis=1)[:, None]
+            cos_i = np.einsum("ij,ij->i", n, beam)
+            # Grazing surfaces barely move along their normal; very near ones
+            # have no error to speak of (it scales as d^2).
+            ok = (np.abs(cos_i) > 0.3) & (d[idx] > 800.0)
+            if ok.sum() < 1000:
+                continue
+            rows.append((r[ok], cos_i[ok], d[idx][ok], _refit(pid, ok),
+                         uv[ok]))
+        if not rows:
+            return total
+        r = np.concatenate([x[0] for x in rows])
+        cos_i = np.concatenate([x[1] for x in rows])
+        dd = np.concatenate([x[2] for x in rows])
+        # Patch ids must stay distinct across the two grids.
+        off = np.cumsum([0] + [x[3].max() + 1 for x in rows[:-1]])
+        pid = np.concatenate([x[3] + o for x, o in zip(rows, off)])
+        uv = np.concatenate([x[4] for x in rows])
+        if (dd > 2000.0).sum() < 2000:
+            return total             # nothing far enough to see the error
+        if rnd == 0:
+            # Where there is enough data to pin the model down; see the
+            # notes on RANGE_ERROR for why it stops there.
+            span = tuple(float(v) for v in np.percentile(dd, [1.0, 98.0]))
+
+        def design(period, power, drift=drift):
+            A = cos_i[:, None] * _range_basis(dd, period, power, harmonics,
+                                              drift, span)
+            y = _project_out_plane(np.column_stack([r, A]), pid, uv)
+            return y[:, 1:], y[:, 0]
+
+        if rnd == 0:
+            # The period is set by the sensor's pixel pitch and optics, so it
+            # is searched rather than assumed -- on a subsample, it is only
+            # choosing a basin.
+            sub = np.random.default_rng(0).permutation(len(r))[:150000]
+            keep = np.zeros(len(r), bool)
+            keep[sub] = True
+            r_all, cos_all, dd_all, pid_all, uv_all = r, cos_i, dd, pid, uv
+            r, cos_i, dd, uv = r[keep], cos_i[keep], dd[keep], uv[keep]
+            pid = _refit(pid, keep)
+            def err(period, power):
+                A, y = design(period, power, 1)
+                sol = np.linalg.lstsq(A, y, rcond=None)[0]
+                return np.mean((y - A @ sol) ** 2), np.mean(y ** 2)
+            # The period does not depend on how the amplitude grows, so it is
+            # found at the textbook d^2 first, then the growth at that period.
+            best = min((err(t, 2.0)[0], t) for t in
+                       np.arange(periods[0], periods[1], 0.05))
+            period = best[1]
+            fits = [(err(period, pw), pw) for pw in np.arange(1.5, 5.01, 0.25)]
+            (e, base), power = min(fits, key=lambda f: f[0][0])
+            # Not worth it unless it explains a real share of what is left.
+            if e > 0.97 * base:
+                return None
+            r, cos_i, dd, pid, uv = r_all, cos_all, dd_all, pid_all, uv_all
+        A, y = design(period, power)
+        sol = np.linalg.lstsq(A, y, rcond=None)[0]
+        w = 1.0 / np.maximum(1.0, np.abs(y - A @ sol) / 3.0)
+        sol = np.linalg.lstsq(A * w[:, None], y * w, rcond=None)[0]
+        if total is None:
+            total = np.r_[period, power, drift, span, sol]
+        else:
+            total = np.r_[total[:5], total[5:] + sol]
+    return tuple(float(v) for v in total)
+
+
+def range_error_at(range_error, d_mm):
+    """Peak size of the modelled error within a ripple of range d_mm, for
+    display."""
+    if range_error is None or len(range_error) < 7:
+        return 0.0
+    u = 1e6 / d_mm
+    # One full period of the ripple around d_mm.
+    d = 1e6 / np.linspace(u - 0.5 * range_error[0], u + 0.5 * range_error[0],
+                          64)
+    return float(np.abs(correct_range(d, range_error) - d).max())
 
 
 def fit_microstep_cached(cap, **geometry):

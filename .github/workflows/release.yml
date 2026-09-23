@@ -1,0 +1,84 @@
+# Push a tag like v1.2.0 and this builds the firmware and the Windows app and
+# publishes them as a GitHub release. "Run workflow" in the Actions tab does
+# the same builds without releasing (artifacts only), to check a build.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+      - run: pip install platformio
+      - run: pio run -e pico
+      - run: cp .pio/build/pico/firmware.uf2 XScan3D-firmware.uf2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: XScan3D-firmware.uf2
+
+  app:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      # The tag is the version: v1.2.0 -> 1.2.0 in the installer and the exe.
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          node -e "const f='src-tauri/tauri.conf.json',j=require('./'+f);j.version='$v';require('fs').writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+          sed -i "0,/^version = .*/s//version = \"$v\"/" src-tauri/Cargo.toml
+      - run: npm ci
+      - run: npm run tauri build
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p ../out
+          cp src-tauri/target/release/xscan3d.exe ../out/XScan3D-portable.exe
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe ../out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [firmware, app]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

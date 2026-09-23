@@ -45,10 +45,11 @@ def load(path):
 class Scene:
     """The capture, reduced to what a trial geometry needs."""
 
-    def __init__(self, cap, reverse, microstep):
+    def __init__(self, cap, reverse, microstep, range_error):
         self.cap = cap
         self.reverse = reverse
         self.microstep = microstep
+        self.range_error = range_error
         # Shaft angle per kept point, for splitting out the seam.
         _, _, self.platform = sp.build_cloud(cap, lidar_reverse=reverse,
                                              scan_tilt=0.0)
@@ -56,7 +57,8 @@ class Scene:
     def cloud(self, rotation, spacing, tilt):
         xyz, _, _ = sp.build_cloud(
             self.cap, lidar_rotation=rotation, lidar_reverse=self.reverse,
-            emitter_spacing=spacing, scan_tilt=tilt, microstep=self.microstep)
+            emitter_spacing=spacing, scan_tilt=tilt, microstep=self.microstep,
+            range_error=self.range_error)
         return xyz
 
 
@@ -172,15 +174,19 @@ CALIBRATION_MAX_FRAMES = 120000
 
 
 def calibrate(cap, rotation, spacing, tilt, reverse=sp.LIDAR_REVERSE,
-              progress=None, cancelled=None,
+              range_error=None, progress=None, cancelled=None,
               max_frames=CALIBRATION_MAX_FRAMES):
-    """Fit lidar roll, emitter spacing and scan-plane tilt to one capture.
+    """Fit lidar roll, emitter spacing and scan-plane tilt to one capture,
+    and the lidar's range non-linearity (scan_proto.RANGE_ERROR) with them.
 
     Starts from the given values. `progress(text, fraction)` is called as the
     fit goes; `cancelled()` is polled and, once true, aborts with Cancelled.
-    Returns a dict: rotation, spacing, tilt, plus `before` and `after`, each a
-    dict of the scores (planes, up, horizon, down; mm) at the start and end,
-    and `stride`: 1 if every frame was used, else N for every Nth.
+    `range_error` is the range model in use now (None for none).
+    Returns a dict: rotation, spacing, tilt, range_error (the fitted model, or
+    the starting one if the scan could not improve on it), range_error_before,
+    plus `before` and `after`, each a dict of the scores (planes, up,
+    horizon, down; mm) at the start and end, and `stride`: 1 if every frame
+    was used, else N for every Nth.
     Raises ValueError if the capture has nothing to fit against.
 
     `max_frames` caps how many lidar frames are scored; a longer capture is
@@ -207,14 +213,29 @@ def calibrate(cap, rotation, spacing, tilt, reverse=sp.LIDAR_REVERSE,
         stride = 1
     say("fitting the microstep error", 0.0)
     micro = sp.fit_microstep(cap, lidar_rotation=x0[0], emitter_spacing=x0[1],
-                             scan_tilt=x0[2], lidar_reverse=reverse)
-    scene = Scene(cap, reverse, micro)
+                             scan_tilt=x0[2], lidar_reverse=reverse,
+                             range_error=range_error)
+
+    def fit_range(x):
+        if cancelled is not None and cancelled():
+            raise Cancelled()
+        fitted = sp.fit_range_error(
+            cap, microstep=micro, lidar_rotation=x[0], emitter_spacing=x[1],
+            scan_tilt=x[2], lidar_reverse=reverse)
+        return range_error if fitted is None else fitted
+
+    start = Scene(cap, reverse, micro, range_error)
+    # The range error is the lidar's and barely depends on the mount, but the
+    # mount fit is cleaner without it, so it goes first -- and once more at
+    # the end, on the final geometry.
+    say("fitting the range error", 0.01)
+    scene = Scene(cap, reverse, micro, fit_range(x0))
     span = float(np.abs(scene.platform).max())
     if span < 45.0:
         raise ValueError(f"the sweep only covers +-{span:.0f} deg; calibration "
                          "needs the two ends of a +-90 deg sweep to meet")
 
-    say("finding walls, ceiling and floor", 0.02)
+    say("finding walls, ceiling and floor", 0.04)
     planes = find_planes(scene.cloud(*x0))
     if len(planes) < 2:
         raise ValueError("found fewer than two walls/ceilings/floors -- scan "
@@ -227,9 +248,10 @@ def calibrate(cap, rotation, spacing, tilt, reverse=sp.LIDAR_REVERSE,
     def begin(name, lo, hi, expect):
         stage.update(name=name, lo=lo, hi=hi, n=0, expect=expect)
 
-    def detail(x):
-        P = scene.cloud(*x)
-        sm = seam_score(P, scene.platform, span)
+    def detail(x, sc=None):
+        sc = sc or scene
+        P = sc.cloud(*x)
+        sm = seam_score(P, sc.platform, span)
         sm["planes"] = plane_score(P, planes)
         return sm
 
@@ -250,7 +272,7 @@ def calibrate(cap, rotation, spacing, tilt, reverse=sp.LIDAR_REVERSE,
         return (sm["planes"] + sm["horizon"] + sm["down"] + 0.5 * sm["up"]
                 + 4.0 * worse)
 
-    before = detail(x0)
+    before = detail(x0, start)
 
     # The score is bumpy -- the seam terms count a changing set of points -- and
     # roll and tilt interact overhead, so one simplex from the start settles in
@@ -274,16 +296,20 @@ def calibrate(cap, rotation, spacing, tilt, reverse=sp.LIDAR_REVERSE,
         fixed[idx] = v
         return fixed
 
-    begin("roll and spacing", 0.03, 0.30, 45)
+    begin("roll and spacing", 0.05, 0.30, 45)
     x = polish(x0, [True, True, False], 1.0)
     tilts = np.arange(-3.0, 3.01, 0.5)
     begin("tilt search", 0.30, 0.45, len(tilts))
     best = min(tilts, key=lambda t: score(np.array([x[0], x[1], t])))
-    begin("all three", 0.45, 0.99, 80)
+    begin("all three", 0.45, 0.95, 80)
     x = polish(np.array([x[0], x[1], best]), [True, True, True], 0.5)
+    say("refitting the range error", 0.96)
+    scene.range_error = fit_range(x)
     after = detail(x)
     say("done", 1.0)
     return dict(rotation=float(x[0]), spacing=float(x[1]), tilt=float(x[2]),
+                range_error=scene.range_error,
+                range_error_before=range_error,
                 before=before, after=after, stride=stride)
 
 
@@ -320,7 +346,8 @@ def main():
             last[0] = stage
 
     r = calibrate(cap, a.rotation, a.spacing, a.tilt,
-                  reverse=not a.no_reverse, progress=progress,
+                  reverse=not a.no_reverse, range_error=sp.RANGE_ERROR,
+                  progress=progress,
                   max_frames=a.max_frames)
     if r["stride"] > 1:
         print(f"(long sweep: used 1 of every {r['stride']} lidar frames; "
@@ -331,6 +358,11 @@ def main():
     print(f"\nMount geometry: Lidar roll {r['rotation']:.2f} deg, "
           f"Emitter spacing {r['spacing']:.1f} mm, "
           f"Scan-plane tilt {r['tilt']:.2f} deg")
+    if r["range_error"] is not None:
+        print("Range error model (scan_proto.RANGE_ERROR): "
+              + ", ".join(f"{v:.4g}" for v in r["range_error"])
+              + f"  -- about {sp.range_error_at(r['range_error'], 3000):.1f} "
+              "mm at 3 m")
 
 
 if __name__ == "__main__":

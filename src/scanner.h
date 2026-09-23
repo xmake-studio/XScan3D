@@ -42,6 +42,34 @@
 #define SCAN_TRAVEL_SPEED 1600.0f   // microsteps/s, = 180 deg/s
 #define SCAN_TRAVEL_ACCEL 3200.0f   // microsteps/s^2
 
+// --- End stop ---------------------------------------------------------------
+// A hard stop on the frame keeps the tether from twisting, and every scan now
+// starts by finding it rather than trusting wherever home was left: the coils
+// are released between scans, so the shaft can drift or be turned by hand.
+//
+// The platform is driven toward negative angles far enough to hit the stop
+// from anywhere, stalls there, and is then renumbered so that backing off by
+// SCAN_HOME_BACKOFF lands on -scanDegrees_. The sweep that follows is still
+// -scanDegrees_ .. +scanDegrees_, so the host sees the same angles as before;
+// only the zero is now tied to the stop instead of to a manual 'h'.
+//
+// A finished scan leaves the platform at +scanDegrees_, the far end from the
+// stop, rather than bringing it back to the middle. From there SCAN_HOME_DEG
+// is only a little more than the way back, so the rotor stalls against the
+// stop for a few degrees per scan instead of for half a turn.
+//
+// A stalled stepper does not stop exactly at the stop: the field has an
+// equilibrium every electrical cycle (4 full steps, 7.2 deg), so the rotor
+// ends up anywhere from pressed against the stop to half a cycle (3.6 deg)
+// short of it, with the field up to half a cycle past it. The backoff must
+// exceed that half cycle so the field is certainly back on the free side and
+// dragging the rotor with it, which is why it is 5 and not 1.
+#define SCAN_HOME_DEG     210.0f   // at least this far into the stop
+#define SCAN_HOME_BACKOFF 5.0f     // at least this far back out of it
+// Slower than travel: the rotor hits the stop at this speed, and a gentle
+// arrival rings less and bounces the rotor off fewer equilibria.
+#define SCAN_HOME_SPEED   800.0f   // microsteps/s, = 90 deg/s
+
 // Parking overshoots slightly and the sensor rings; let it die out before the
 // data that has to be accurate starts flowing.
 #define SCAN_SETTLE_MS 1500
@@ -79,7 +107,7 @@
 #define TELEM_PERIOD_MS 100
 
 // --- Completion chime -------------------------------------------------------
-// When a scan is done and the platform is back home, the motor itself plays a
+// When a scan is done and the platform has stopped, the motor itself plays a
 // two-note chime. Volume is the swing of each note in microsteps (see the note
 // table in playChime): 16 is a full step each way and loudest, 4 is moderate,
 // 1 is barely audible. Lower notes come out louder for the same swing -- the
@@ -91,7 +119,7 @@
 
 enum ScanState : uint8_t {
   SCAN_IDLE = 0,
-  SCAN_PARKING,    // travelling to -SCAN_DEGREES
+  SCAN_PARKING,    // backing off the end stop to -scanDegrees_
   SCAN_SETTLING,   // parked, waiting for the wobble to stop
   SCAN_SWEEPING,   // the run that produces the cloud
   SCAN_DONE,
@@ -99,6 +127,7 @@ enum ScanState : uint8_t {
   SCAN_STEP_SETTLE,   // stopped, waiting for the ring-down
   SCAN_STEP_CAPTURE,  // stopped, streaming lidar at a fixed angle
   SCAN_UNWRAP,        // turning the shaft to unwind the tether
+  SCAN_HOMING,        // driving into the end stop (last: telemetry numbers)
 };
 
 // Owns the motor and the USB link. main() just pumps it.
@@ -115,6 +144,10 @@ class Scanner {
   void handleCommands();
   void runCommand(char cmd, const char *arg, bool hasArg);
   void emitConfig();
+  void serviceCalibTx();
+  void serviceCalibRx();
+  void beginCalibWrite(const char *arg, bool hasArg);
+  void finishCalibWrite();
   void serviceLidar();
   void serviceTelemetry();
   void serviceIdlePower();
@@ -159,6 +192,21 @@ class Scanner {
 
   char    line_[24];         // one command line being assembled
   uint8_t lineLen_ = 0;
+
+  // A calibration write in flight: the raw bytes that follow a 'w' line go
+  // here instead of into the line parser. rxDiscard_ still counts them off
+  // when the write is too long to keep, so they are never run as commands.
+  uint8_t  calibRx_[CALIB_MAX_LEN];
+  bool     rxActive_  = false;
+  bool     rxDiscard_ = false;
+  uint16_t rxLen_     = 0;
+  uint16_t rxGot_     = 0;
+  uint32_t rxCrc_     = 0;
+  uint32_t rxAt_      = 0;   // millis() of the last byte received
+
+  // The stored calibration going out in chunks; see serviceCalibTx().
+  bool     txPending_ = false;
+  uint16_t txOff_     = 0;
 
   // Set when the coils are released, cleared once the host has been told the
   // angle may have moved, so the warning is one per release and not per scan.
