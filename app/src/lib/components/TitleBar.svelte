@@ -94,6 +94,11 @@
     align-items: center;
     z-index: 40;
     padding-left: 10px;
+    /* Solid frosted backing so text stays legible over bright scan points. */
+    background: var(--glass-strong);
+    backdrop-filter: saturate(180%) blur(28px);
+    -webkit-backdrop-filter: saturate(180%) blur(28px);
+    border-bottom: 1px solid var(--glass-border);
   }
   .left,
   .right {
