@@ -67,8 +67,10 @@ cargo run --release --example dev_assets -- ../dev-assets ../../scans/room.bin .
 The ports are numerically faithful: on `scans/room.bin` the reconstructed
 cloud matches the Python one to 0.0001 mm (float32 rounding), the microstep
 coefficients to 5e-15 degrees, and a merge of two real scans returns the same
-transform to 0.1 mm — while being 16x (microstep), 30x (merge) and 30x
-(calibration) faster.
+transform to 0.1 mm — while being 16x (microstep) and 30x (merge) faster.
+The mount calibration has since moved past `calibrate_mount.py`: it fits the
+seam by Gauss-Newton instead of the script's Nelder-Mead over plane and seam
+scores, so the two agree on the overlap they measure but not on the result.
 
 ## The scan library
 

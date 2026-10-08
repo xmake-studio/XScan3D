@@ -157,7 +157,7 @@ export type MeshEvent =
   | { kind: "done"; key: string; info: MeshInfo }
   | { kind: "failed"; detail: string };
 
-export type CalibStage = "microstep" | "range" | "planes" | "rollSpacing" | "tiltSearch" | "allThree" | "rangeRefit" | "done";
+export type CalibStage = "microstep" | "range" | "planes" | "seam" | "rangeRefit" | "done";
 
 export interface CalibScores {
   planes: number;

@@ -298,8 +298,8 @@ export function mockBackend(): Backend {
       return (await fetch("/dev-assets/mesh.xsm")).arrayBuffer();
     },
     async calibrateStart() {
-      const stages = ["microstep", "range", "planes", "rollSpacing", "tiltSearch", "allThree", "rangeRefit"] as const;
-      stages.forEach((s, i) => setTimeout(() => emit("calib", { kind: "progress", stage: s, fraction: (i + 1) / 8 }), i * 400));
+      const stages = ["microstep", "range", "planes", "seam", "rangeRefit"] as const;
+      stages.forEach((s, i) => setTimeout(() => emit("calib", { kind: "progress", stage: s, fraction: (i + 1) / 6 }), i * 600));
       setTimeout(() => emit("calib", {
         kind: "done", scan: "x",
         result: { rotation: 161.96, spacing: -38.69, tilt: -1.22, rangeError: settings.mount.rangeError, rangeErrorBefore: settings.mount.rangeError, rangeAt3mBefore: 7.81, rangeAt3mAfter: 7.76, before: { planes: 2.01, up: 8.56, horizon: 1.66, down: 0.49 }, after: { planes: 1.79, up: 1.87, horizon: 1.67, down: 0.75 }, stride: 2 },

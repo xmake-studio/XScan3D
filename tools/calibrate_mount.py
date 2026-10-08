@@ -137,11 +137,14 @@ def plane_score(P, planes):
 def seam_score(P, platform, span, margin=10.0, radius=50.0):
     """How well the two ends of the sweep agree, by elevation band.
 
-    Points from the last `margin` degrees are measured against local planes
-    fitted to points from the first `margin` degrees.
+    Points from the end of the sweep are measured against local planes fitted
+    to points from its start, over every shaft angle both ends see: a sweep
+    wider than +-90 sees (180 - span, span) twice, which with the tilt overlap
+    is tens of degrees, not just the last `margin`.
     """
-    end = np.flatnonzero(platform > span - margin)[::2]
-    start = platform < -span + margin
+    edge = min(180.0 - span, span - margin)
+    end = np.flatnonzero(platform > edge)[::2]
+    start = platform < -edge
     A, B = P[end], P[start]
     tree = cKDTree(B)
     res = np.full(len(A), np.nan)

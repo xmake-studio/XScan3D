@@ -2,10 +2,12 @@
 //! scan-plane tilt (tools/calibrate_mount.py) and the lidar's range
 //! non-linearity (scan_proto.fit_range_error).
 //!
-//! Nothing needs a target: a room is full of surfaces known to be flat. The
-//! big planes (walls, ceiling, floor) are found once and refitted under each
-//! trial geometry, and the seam where the two ends of the sweep meet is scored
-//! overhead, at the horizon and below, so no band is traded for another.
+//! Nothing needs a target: where the two ends of the sweep meet, every
+//! surface is seen twice, once by each half of the lidar's revolution, and the
+//! mount geometry is what makes the two copies agree. Roll, spacing and tilt
+//! are fitted to that seam by Gauss-Newton, overhead, at the horizon and below
+//! weighed alike, so no band is traded for another. The big planes (walls,
+//! ceiling, floor) are found once and scored before and after, for the report.
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -25,6 +27,8 @@ pub const CALIBRATION_MAX_FRAMES: usize = 120_000;
 pub struct Cancelled;
 
 type Progress<'a> = &'a (dyn Fn(Stage, f64) + Sync);
+/// The cloud under a trial (roll, spacing, tilt).
+type TrialCloud<'a> = &'a dyn Fn(&[f64; 3]) -> Result<Vec<V3>, CalibError>;
 type IsCancelled<'a> = &'a (dyn Fn() -> bool + Sync);
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -33,9 +37,7 @@ pub enum Stage {
     Microstep,
     Range,
     Planes,
-    RollSpacing,
-    TiltSearch,
-    AllThree,
+    Seam,
     RangeRefit,
     Done,
 }
@@ -371,131 +373,208 @@ fn plane_score(p: &[V3], planes: &[Vec<u32>]) -> f64 {
     tot / wsum.max(1e-12)
 }
 
-fn seam_score(p: &[V3], platform: &[f32], span: f64) -> Scores {
+/// The two ends of the sweep that see the same directions: points past
+/// `edge` at the end, and before `-edge` at the start.
+///
+/// A slice at shaft angle phi covers azimuth phi with one half of the lidar's
+/// revolution and phi + 180 with the other, so a sweep of +-span sees every
+/// direction with a shaft angle in (180 - span, span) twice: once at the end
+/// and once, through the other half, at the start. The automatic sweep is
+/// wider than +-90 by the tilt overlap, often by 20 degrees, so this is a
+/// band tens of degrees wide rather than a line; a sweep of +-90 or less still
+/// gets the last `margin` degrees, where the two ends at least come close.
+fn seam_edge(span: f64) -> f64 {
     let margin = 10.0;
-    let radius = 50.0;
-    let end: Vec<usize> = (0..p.len()).filter(|&i| platform[i] as f64 > span - margin).step_by(2).collect();
-    let start: Vec<V3> = (0..p.len()).filter(|&i| (platform[i] as f64) < -span + margin).map(|i| p[i]).collect();
-    if end.is_empty() || start.len() < 10 {
-        return Scores::default();
+    (180.0 - span).min(span - margin)
+}
+
+/// Elevation bands the seam is balanced over: below, at and above the horizon.
+const SEAM_BANDS: usize = 3;
+
+fn seam_band(el: f64) -> usize {
+    if el < -30.0 {
+        0
+    } else if el <= 30.0 {
+        1
+    } else {
+        2
     }
-    let tree = KdTree::new(&start);
-    let res: Vec<(f64, f64)> = end
-        .par_iter()
+}
+
+/// A point from the end of the sweep and the patch of the start's surface it
+/// should lie on. Cloud indices do not depend on the mount geometry, so a pair
+/// found under one trial geometry can be measured under another.
+struct SeamPair {
+    end: u32,
+    start: Vec<u32>,
+    normal: V3,
+    band: u8,
+}
+
+/// Pairs every other end point with the flat start surface within 50 mm.
+fn seam_pairs(p: &[V3], platform: &[f32], span: f64) -> Vec<SeamPair> {
+    let edge = seam_edge(span);
+    let end: Vec<usize> = (0..p.len()).filter(|&i| platform[i] as f64 > edge).step_by(2).collect();
+    let start: Vec<u32> = (0..p.len()).filter(|&i| (platform[i] as f64) < -edge).map(|i| i as u32).collect();
+    if end.is_empty() || start.len() < 10 {
+        return Vec::new();
+    }
+    let sp: Vec<V3> = start.iter().map(|&i| p[i as usize]).collect();
+    let tree = KdTree::new(&sp);
+    end.par_iter()
         .map_init(Vec::new, |buf, &i| {
             let a = p[i];
-            tree.within(a, radius * radius, buf);
+            tree.within(a, 50.0 * 50.0, buf);
             if buf.len() < 10 {
-                return (f64::NAN, 0.0);
+                return None;
             }
-            let (c, cov, _) = util::centered_cov(buf.iter().map(|&j| start[j]));
+            let (c, cov, _) = util::centered_cov(buf.iter().map(|&j| sp[j]));
             let (w, vec) = sym3_eigen(cov);
             if w[1] < 25.0 || w[0] > 0.05 * w[1] {
-                return (f64::NAN, 0.0);
+                return None;
+            }
+            // Further off than this is another surface, not the same one.
+            if dot(util::sub(a, c), vec[0]).abs() > 30.0 {
+                return None;
             }
             let el = a[2].atan2(a[0].hypot(a[1])).to_degrees();
-            (dot(util::sub(a, c), vec[0]).abs(), el)
+            Some(SeamPair { end: i as u32, start: buf.iter().map(|&j| start[j]).collect(), normal: vec[0], band: seam_band(el) as u8 })
         })
-        .collect();
-    let band = |f: &dyn Fn(f64) -> bool| {
-        let v: Vec<f64> = res.iter().filter(|(r, el)| r.is_finite() && f(*el)).map(|(r, _)| r.min(15.0)).collect();
+        .flatten()
+        .collect()
+}
+
+/// Signed distance of each pair's end point from its start patch.
+fn seam_residuals(p: &[V3], pairs: &[SeamPair]) -> Vec<f64> {
+    pairs
+        .par_iter()
+        .map(|s| {
+            let mut c = [0.0; 3];
+            for &j in &s.start {
+                c = util::add(c, p[j as usize]);
+            }
+            let c = util::scale(c, 1.0 / s.start.len() as f64);
+            dot(util::sub(p[s.end as usize], c), s.normal)
+        })
+        .collect()
+}
+
+/// Mean distance across the seam overhead, at the horizon and below.
+fn seam_score(p: &[V3], platform: &[f32], span: f64) -> Scores {
+    let pairs = seam_pairs(p, platform, span);
+    let r = seam_residuals(p, &pairs);
+    let band = |b: usize| {
+        let v: Vec<f64> = pairs.iter().zip(&r).filter(|(s, _)| s.band as usize == b).map(|(_, r)| r.abs().min(15.0)).collect();
         if v.is_empty() {
             0.0
         } else {
             v.iter().sum::<f64>() / v.len() as f64
         }
     };
-    Scores {
-        planes: 0.0,
-        up: band(&|el| el > 45.0),
-        horizon: band(&|el| el.abs() < 30.0),
-        down: band(&|el| el < -30.0),
+    Scores { planes: 0.0, up: band(2), horizon: band(1), down: band(0) }
+}
+
+/// Huber loss, mm.
+const HUBER: f64 = 3.0;
+
+fn huber(r: f64) -> f64 {
+    if r.abs() < HUBER {
+        0.5 * r * r
+    } else {
+        HUBER * (r.abs() - 0.5 * HUBER)
     }
 }
 
-/// scipy.optimize's Nelder-Mead (non-adaptive), with an explicit initial
-/// simplex and its xatol/fatol/maxiter termination.
-fn nelder_mead(
-    f: &mut dyn FnMut(&[f64]) -> Result<f64, Cancelled>,
-    simplex: Vec<Vec<f64>>,
-    xatol: f64,
-    fatol: f64,
-    maxiter: usize,
-) -> Result<Vec<f64>, Cancelled> {
-    let (rho, chi, psi, sigma) = (1.0, 2.0, 0.5, 0.5);
-    let n = simplex.len() - 1;
-    let mut sim = simplex;
-    let mut fsim: Vec<f64> = Vec::with_capacity(n + 1);
-    for x in &sim {
-        fsim.push(f(x)?);
-    }
-    let sort = |sim: &mut Vec<Vec<f64>>, fsim: &mut Vec<f64>| {
-        let mut ord: Vec<usize> = (0..fsim.len()).collect();
-        ord.sort_by(|&a, &b| fsim[a].total_cmp(&fsim[b]));
-        *sim = ord.iter().map(|&i| sim[i].clone()).collect();
-        *fsim = ord.iter().map(|&i| fsim[i]).collect();
-    };
-    sort(&mut sim, &mut fsim);
-    let mut iterations = 1;
-    while iterations < maxiter {
-        let xspread = (1..=n).flat_map(|j| (0..n).map(move |k| (j, k))).map(|(j, k)| (sim[j][k] - sim[0][k]).abs()).fold(0.0, f64::max);
-        let fspread = (1..=n).map(|j| (fsim[0] - fsim[j]).abs()).fold(0.0, f64::max);
-        if xspread <= xatol && fspread <= fatol {
+/// Fits roll, spacing and tilt to the seam by Gauss-Newton.
+///
+/// Each round pairs the two ends of the sweep under the current geometry,
+/// measures how every pair's residual moves with each parameter (by finite
+/// differences: three more clouds), and takes the robust least-squares step,
+/// halved until it actually lowers the misfit of those same pairs. Each
+/// elevation band weighs the same in total, so the few pairs overhead -- the
+/// ceiling and whatever hangs from it -- count as much as the many below.
+fn refine_seam(
+    x0: [f64; 3],
+    span: f64,
+    cloud: TrialCloud,
+    platform: &[f32],
+    progress: &dyn Fn(f64),
+    cancelled: IsCancelled,
+) -> Result<[f64; 3], CalibError> {
+    const ROUNDS: usize = 8;
+    // Finite-difference steps, and the most one round may move: roll and tilt
+    // in degrees, spacing in mm.
+    let h = [0.05, 1.0, 0.1];
+    let max_step = [1.0, 10.0, 1.0];
+    let done = [0.002, 0.02, 0.002];
+    let mut x = x0;
+    for round in 0..ROUNDS {
+        if cancelled() {
+            return Err(CalibError::Cancelled);
+        }
+        progress(round as f64 / ROUNDS as f64);
+        let p = cloud(&x)?;
+        let pairs = seam_pairs(&p, platform, span);
+        if pairs.len() < 100 {
             break;
         }
-        let mut xbar = vec![0.0; n];
-        for x in &sim[..n] {
-            for k in 0..n {
-                xbar[k] += x[k] / n as f64;
+        let mut count = [0usize; SEAM_BANDS];
+        for s in &pairs {
+            count[s.band as usize] += 1;
+        }
+        let bw: Vec<f64> = count.iter().map(|&n| if n >= 50 { 1.0 / n as f64 } else { 0.0 }).collect();
+        let w: Vec<f64> = pairs.iter().map(|s| bw[s.band as usize]).collect();
+        let loss = |r: &[f64]| r.iter().zip(&w).map(|(r, w)| w * huber(*r)).sum::<f64>();
+        let r0 = seam_residuals(&p, &pairs);
+        let mut jac = Vec::with_capacity(3);
+        for k in 0..3 {
+            let mut y = x;
+            y[k] += h[k];
+            let rk = seam_residuals(&cloud(&y)?, &pairs);
+            jac.push(rk.iter().zip(&r0).map(|(a, b)| (a - b) / h[k]).collect::<Vec<f64>>());
+        }
+        // Iteratively reweighted least squares for the Huber loss.
+        let mut d = [0.0; 3];
+        for _ in 0..6 {
+            let mut ata = [0.0; 9];
+            let mut atb = [0.0; 3];
+            for i in 0..r0.len() {
+                let e = r0[i] + (0..3).map(|k| jac[k][i] * d[k]).sum::<f64>();
+                let wi = w[i] * if e.abs() < HUBER { 1.0 } else { HUBER / e.abs() };
+                for k in 0..3 {
+                    atb[k] -= wi * jac[k][i] * r0[i];
+                    for l in 0..3 {
+                        ata[k * 3 + l] += wi * jac[k][i] * jac[l][i];
+                    }
+                }
+            }
+            // A parameter the seam cannot see stays where it is.
+            for k in 0..3 {
+                ata[k * 3 + k] += 1e-9 * ata.iter().step_by(4).fold(0.0f64, |a, &b| a.max(b)).max(1e-30);
+            }
+            let Some(s) = util::solve_dense(&ata, &atb, 3) else { break };
+            for k in 0..3 {
+                d[k] = s[k].clamp(-max_step[k], max_step[k]);
             }
         }
-        let comb = |a: f64, b: f64, x: &[f64]| -> Vec<f64> { (0..n).map(|k| a * xbar[k] + b * x[k]).collect() };
-        let xr = comb(1.0 + rho, -rho, &sim[n]);
-        let fxr = f(&xr)?;
-        let mut shrink = false;
-        if fxr < fsim[0] {
-            let xe = comb(1.0 + rho * chi, -rho * chi, &sim[n]);
-            let fxe = f(&xe)?;
-            if fxe < fxr {
-                sim[n] = xe;
-                fsim[n] = fxe;
-            } else {
-                sim[n] = xr;
-                fsim[n] = fxr;
+        let before = loss(&r0);
+        let mut t = 1.0;
+        let mut moved = false;
+        for _ in 0..5 {
+            let y = [x[0] + t * d[0], x[1] + t * d[1], x[2] + t * d[2]];
+            if loss(&seam_residuals(&cloud(&y)?, &pairs)) < before {
+                x = y;
+                moved = true;
+                break;
             }
-        } else if fxr < fsim[n - 1] {
-            sim[n] = xr;
-            fsim[n] = fxr;
-        } else if fxr < fsim[n] {
-            let xc = comb(1.0 + psi * rho, -psi * rho, &sim[n]);
-            let fxc = f(&xc)?;
-            if fxc <= fxr {
-                sim[n] = xc;
-                fsim[n] = fxc;
-            } else {
-                shrink = true;
-            }
-        } else {
-            let xcc = comb(1.0 - psi, psi, &sim[n]);
-            let fxcc = f(&xcc)?;
-            if fxcc < fsim[n] {
-                sim[n] = xcc;
-                fsim[n] = fxcc;
-            } else {
-                shrink = true;
-            }
+            t *= 0.5;
         }
-        if shrink {
-            for j in 1..=n {
-                let x: Vec<f64> = (0..n).map(|k| sim[0][k] + sigma * (sim[j][k] - sim[0][k])).collect();
-                fsim[j] = f(&x)?;
-                sim[j] = x;
-            }
+        if !moved || (0..3).all(|k| (t * d[k]).abs() < done[k]) {
+            break;
         }
-        iterations += 1;
-        sort(&mut sim, &mut fsim);
     }
-    Ok(sim.swap_remove(0))
+    progress(1.0);
+    Ok(x)
 }
 
 /// Fits roll, spacing and tilt (and the range model around them) to one
@@ -559,73 +638,8 @@ pub fn calibrate(cap: &Capture, base: &Mount, progress: Progress, cancelled: IsC
     };
     let before = detail(&x0, range_start.as_deref())?;
 
-    struct StageInfo {
-        stage: Stage,
-        lo: f64,
-        hi: f64,
-        n: usize,
-        expect: usize,
-    }
-    let info = std::cell::RefCell::new(StageInfo { stage: Stage::RollSpacing, lo: 0.05, hi: 0.30, n: 0, expect: 45 });
-    let range_ref = std::cell::RefCell::new(range_now.clone());
-    let mut score = |x: &[f64; 3]| -> Result<f64, Cancelled> {
-        if cancelled() {
-            return Err(Cancelled);
-        }
-        let r = range_ref.borrow().clone();
-        let sm = detail(x, r.as_deref()).map_err(|_| Cancelled)?;
-        let mut st = info.borrow_mut();
-        st.n += 1;
-        let f = (st.n as f64 / st.expect as f64).min(1.0);
-        progress(st.stage, st.lo + f * (st.hi - st.lo));
-        // The horizon seam must not get worse than it started: it is the one
-        // usually already tuned by eye.
-        let worse = (sm.horizon - before.horizon).max(0.0);
-        Ok(sm.planes + sm.horizon + sm.down + 0.5 * sm.up + 4.0 * worse)
-    };
-
-    let polish = |x: [f64; 3], free: [bool; 3], step: f64, score: &mut dyn FnMut(&[f64; 3]) -> Result<f64, Cancelled>| -> Result<[f64; 3], CalibError> {
-        let idx: Vec<usize> = (0..3).filter(|&i| free[i]).collect();
-        let deltas = [0.3, 4.0, -0.5];
-        let mut simplex = vec![idx.iter().map(|&i| x[i]).collect::<Vec<f64>>()];
-        for &i in &idx {
-            let mut y = x;
-            y[i] += deltas[i] * step;
-            simplex.push(idx.iter().map(|&k| y[k]).collect());
-        }
-        let mut sub = |v: &[f64]| -> Result<f64, Cancelled> {
-            let mut y = x;
-            for (k, &i) in idx.iter().enumerate() {
-                y[i] = v[k];
-            }
-            score(&y)
-        };
-        let v = nelder_mead(&mut sub, simplex, 0.01, 1e-4, 150).map_err(|_| CalibError::Cancelled)?;
-        let mut out = x;
-        for (k, &i) in idx.iter().enumerate() {
-            out[i] = v[k];
-        }
-        Ok(out)
-    };
-
-    let x = polish(x0, [true, true, false], 1.0, &mut score)?;
-    {
-        let mut st = info.borrow_mut();
-        *st = StageInfo { stage: Stage::TiltSearch, lo: 0.30, hi: 0.45, n: 0, expect: 13 };
-    }
-    let mut best_t = (f64::INFINITY, x[2]);
-    for k in 0..13 {
-        let t = -3.0 + 0.5 * k as f64;
-        let s = score(&[x[0], x[1], t]).map_err(|_| CalibError::Cancelled)?;
-        if s < best_t.0 {
-            best_t = (s, t);
-        }
-    }
-    {
-        let mut st = info.borrow_mut();
-        *st = StageInfo { stage: Stage::AllThree, lo: 0.45, hi: 0.95, n: 0, expect: 80 };
-    }
-    let x = polish([x[0], x[1], best_t.1], [true, true, true], 0.5, &mut score)?;
+    let seam_cloud = |x: &[f64; 3]| -> Result<Vec<V3>, CalibError> { Ok(cloud(x, range_now.as_deref())?.0) };
+    let x = refine_seam(x0, span, &seam_cloud, &plat0, &|f| progress(Stage::Seam, 0.05 + 0.9 * f), cancelled)?;
     progress(Stage::RangeRefit, 0.96);
     range_now = fit_range(&x)?;
     let after = detail(&x, range_now.as_deref())?;
@@ -642,4 +656,114 @@ pub fn calibrate(cap: &Capture, base: &Mount, progress: Progress, cancelled: IsC
         after,
         stride,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Sample, POINTS, RAW_ANGLE_MAX, RAW_ANGLE_MIN};
+
+    const RAW_PER_DEG: f64 = (RAW_ANGLE_MAX - RAW_ANGLE_MIN) as f64 / 360.0;
+
+    /// Distance along a ray to the first surface of a room: a box turned 25
+    /// degrees off the seam, with a smaller box hanging under its ceiling.
+    fn trace(o: V3, u: V3) -> f64 {
+        let (s, c) = 25f64.to_radians().sin_cos();
+        let rot = |v: V3| [c * v[0] + s * v[1], -s * v[0] + c * v[1], v[2]];
+        let (o, u) = (rot(o), rot(u));
+        let (lo, hi) = ([-2200.0, -1800.0, -900.0], [2000.0, 2300.0, 1500.0]);
+        let mut t = f64::INFINITY;
+        for k in 0..3 {
+            if u[k] > 1e-12 {
+                t = t.min((hi[k] - o[k]) / u[k]);
+            } else if u[k] < -1e-12 {
+                t = t.min((lo[k] - o[k]) / u[k]);
+            }
+        }
+        // The box under the ceiling (slab method).
+        let (blo, bhi) = ([-700.0, 1500.0, 1150.0], [300.0, 2300.0, 1500.0]);
+        let (mut t0, mut t1) = (0.0f64, f64::INFINITY);
+        for k in 0..3 {
+            if u[k].abs() < 1e-12 {
+                if o[k] < blo[k] || o[k] > bhi[k] {
+                    t1 = -1.0;
+                }
+                continue;
+            }
+            let (a, b) = ((blo[k] - o[k]) / u[k], (bhi[k] - o[k]) / u[k]);
+            t0 = t0.max(a.min(b));
+            t1 = t1.min(a.max(b));
+        }
+        if t1 >= t0 && t0 > 0.0 {
+            t = t.min(t0);
+        }
+        t
+    }
+
+    /// A +-`span` sweep of that room by a rig bolted together as `m`.
+    fn synthetic(m: &Mount, span: f64) -> Capture {
+        let (st, ct) = m.scan_tilt.to_radians().sin_cos();
+        let mut cap = Capture::new();
+        let step = 0.5;
+        let frame = POINTS as f64 * step;
+        let revs = (2.0 * span / step) as usize;
+        for r in 0..=revs {
+            let plat = -span + r as f64 * step;
+            let (sy, cy) = plat.to_radians().sin_cos();
+            let yaw = |v: V3| [cy * v[0] - sy * v[1], sy * v[0] + cy * v[1], v[2]];
+            for f in 0..(360.0 / frame) as usize {
+                let a0 = f as f64 * frame;
+                let mut dist = [0u16; POINTS];
+                for (i, d) in dist.iter_mut().enumerate() {
+                    let az = a0 + i as f64 * step;
+                    let th = ((if m.lidar_reverse { -az } else { az }) + m.lidar_rotation).to_radians();
+                    let (s, c) = th.sin_cos();
+                    let b = 0.5 * m.emitter_spacing;
+                    let tilt = |v: V3| [v[0], ct * v[1] - st * v[2], st * v[1] + ct * v[2]];
+                    let o = yaw(tilt([b * c, 0.0, -b * s]));
+                    let u = yaw(tilt([s, 0.0, c]));
+                    *d = trace(o, u).round().min(8000.0) as u16;
+                }
+                let raw = |deg: f64| RAW_ANGLE_MIN + (deg * RAW_PER_DEG).round() as u16;
+                cap.samples.push(Sample {
+                    t_us: 0,
+                    platform: plat as f32,
+                    speed: 0,
+                    raw_angle: raw(a0),
+                    dist,
+                    end_angle: raw(a0 + (POINTS - 1) as f64 * step),
+                    capturing: true,
+                });
+            }
+        }
+        cap
+    }
+
+    #[test]
+    fn seam_fit_recovers_the_mount() {
+        let mut truth = Mount::default();
+        truth.lidar_rotation = 161.9;
+        truth.emitter_spacing = -38.0;
+        truth.scan_tilt = -1.6;
+        truth.range_correction = false;
+        // As wide as the automatic sweep gets: the seam is a broad band, not
+        // the last few degrees at each end.
+        let cap = synthetic(&truth, 110.0);
+        let cloud = |x: &[f64; 3]| -> Result<(Vec<V3>, Vec<f32>), CalibError> {
+            let c = geometry::build_cloud(&cap, &mount_with(&truth, x, None), None).map_err(|_| CalibError::NoSweep)?;
+            Ok((util::to_f64(&c.xyz), c.platform))
+        };
+        let (_, plat) = cloud(&[161.5, -33.0, 0.0]).unwrap();
+        let span = plat.iter().fold(0.0f64, |a, &b| a.max((b as f64).abs()));
+        let trial = |x: &[f64; 3]| Ok(cloud(x)?.0);
+        let x = refine_seam([161.5, -33.0, 0.0], span, &trial, &plat, &|_| {}, &|| false).unwrap();
+        assert!((x[0] - 161.9).abs() < 0.05, "roll {x:?}");
+        assert!((x[1] + 38.0).abs() < 1.0, "spacing {x:?}");
+        assert!((x[2] + 1.6).abs() < 0.05, "tilt {x:?}");
+        // The seam score sees the whole overlap: well apart before, together after.
+        let (p0, _) = cloud(&[161.5, -33.0, 0.0]).unwrap();
+        let (p1, _) = cloud(&x).unwrap();
+        let (s0, s1) = (seam_score(&p0, &plat, span), seam_score(&p1, &plat, span));
+        assert!(s0.horizon > 2.0 && s1.horizon < 1.0, "{s0:?} -> {s1:?}");
+    }
 }
