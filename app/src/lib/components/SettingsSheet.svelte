@@ -217,6 +217,10 @@
             <Toggle checked={m.microstepAuto} onchange={(v) => mountPatch({ microstepAuto: v })} />
           </div>
           <div class="row">
+            <div class="lbl">{t("settings.drift")}<div class="hint">{t("settings.driftHint")}</div></div>
+            <Toggle checked={m.driftAuto} onchange={(v) => mountPatch({ driftAuto: v })} />
+          </div>
+          <div class="row">
             <div class="lbl">
               {t("settings.rangeCorrection")}
               <div class="hint">{t("settings.rangeHint")} {m.rangeError ? t("settings.rangeAmount", { mm: fixed(app.rangeAt3m || 0, 1) }) : t("settings.notCalibrated")}</div>

@@ -16,7 +16,7 @@ const DEFAULT_SETTINGS: Settings = {
   device: { autoConnect: true, dtr: true, knownSerials: [], calibPending: false },
   mount: {
     lidarRotation: 161.65, lidarReverse: true, emitterSpacing: -36.5, scanTilt: -1.2, scanHalf: "both",
-    flipUpright: false, beamOffset: 0, minRange: 60, maxRange: 0, microstepAuto: true, rangeCorrection: true,
+    flipUpright: false, beamOffset: 0, minRange: 60, maxRange: 0, microstepAuto: true, driftAuto: true, rangeCorrection: true,
     rangeError: [24.7, 3.5, 2, 827, 3561, -0.08861, -0.01755, -0.003573, 0.1086, -0.01447, 0.01174, -0.1113, 0.01858, -0.003672, 0.0393, 0.06772, 0.01801],
   },
   view: { colorMode: "height", pointSize: 1, grid: true, edl: true, camera: "orbit", flySpeed: 1500 },

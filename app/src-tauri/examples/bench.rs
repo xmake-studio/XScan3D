@@ -30,7 +30,7 @@ fn main() {
             let t = Instant::now();
             let base = geometry::Mount::default();
             let coef = geometry::fit_microstep(&cap, &base);
-            let x = [base.lidar_rotation, base.emitter_spacing, base.scan_tilt];
+            let x = [base.lidar_rotation, base.emitter_spacing, base.scan_tilt, 0.0];
             let r = calibration::fit_range_error(&cap, &base, &x, coef.as_deref(), &|| false).unwrap();
             println!("{:.1}s {:?}", t.elapsed().as_secs_f64(), r);
             println!("at 3m: {:.2} mm", geometry::range_error_at(r.as_deref(), 3000.0));

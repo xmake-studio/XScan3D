@@ -391,13 +391,14 @@ fn finish(core: &CoreRef, complete: bool) {
                 group: None,
                 pose: crate::util::identity4(),
                 microstep: None,
+                range_drift: None,
                 source_name: None,
                 bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             };
             match clouds::build_capture(&meta, &cap, &mount) {
                 Ok(b) if b.entry.len() > 0 => {
                     meta.points = b.entry.len();
-                    meta.microstep = b.new_microstep;
+                    b.fits.store(&mut meta);
                     let points = meta.points;
                     core.library.lock().add(meta);
                     core.save_library();

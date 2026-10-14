@@ -27,8 +27,11 @@ pub const CALIBRATION_MAX_FRAMES: usize = 120_000;
 pub struct Cancelled;
 
 type Progress<'a> = &'a (dyn Fn(Stage, f64) + Sync);
-/// The cloud under a trial (roll, spacing, tilt).
-type TrialCloud<'a> = &'a dyn Fn(&[f64; 3]) -> Result<Vec<V3>, CalibError>;
+/// Roll (deg), emitter spacing (mm), scan tilt (deg) and the scan's range
+/// drift (mm per m^2 per minute, see geometry::correct_drift).
+pub type Params = [f64; 4];
+/// The cloud under trial parameters.
+type TrialCloud<'a> = &'a dyn Fn(&Params) -> Result<Vec<V3>, CalibError>;
 type IsCancelled<'a> = &'a (dyn Fn() -> bool + Sync);
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -56,6 +59,9 @@ pub struct CalibResult {
     pub rotation: f64,
     pub spacing: f64,
     pub tilt: f64,
+    /// The calibration scan's own range drift (mm per m^2 per minute); not
+    /// part of the rig's calibration, reported for information.
+    pub range_drift: f64,
     pub range_error: Option<Vec<f64>>,
     pub range_error_before: Option<Vec<f64>>,
     pub range_at_3m_before: f64,
@@ -84,11 +90,12 @@ impl std::fmt::Display for CalibError {
     }
 }
 
-fn mount_with(base: &Mount, x: &[f64; 3], range: Option<&[f64]>) -> Mount {
+fn mount_with(base: &Mount, x: &Params, range: Option<&[f64]>) -> Mount {
     let mut m = base.clone();
     m.lidar_rotation = x[0];
     m.emitter_spacing = x[1];
     m.scan_tilt = x[2];
+    m.range_drift = x[3];
     m.scan_half = ScanHalf::Both;
     m.flip_upright = false;
     m.range_correction = range.is_some();
@@ -123,7 +130,7 @@ fn range_rows<'a>(
 /// Measures the lidar's range non-linearity from a scan. Returns a model in
 /// the RANGE_ERROR layout, `start` if a round found too little to go on, or
 /// None when the scan does not show the error clearly enough to correct.
-pub fn fit_range_error(cap: &Capture, base: &Mount, x: &[f64; 3], microstep: Option<&[f64]>, cancelled: IsCancelled) -> Result<Option<Vec<f64>>, Cancelled> {
+pub fn fit_range_error(cap: &Capture, base: &Mount, x: &Params, microstep: Option<&[f64]>, cancelled: IsCancelled) -> Result<Option<Vec<f64>>, Cancelled> {
     let harmonics = RANGE_HARMONICS;
     let drift = RANGE_DRIFT_TERMS;
     let patch_mm = 200.0;
@@ -485,28 +492,40 @@ fn huber(r: f64) -> f64 {
     }
 }
 
-/// Fits roll, spacing and tilt to the seam by Gauss-Newton.
+/// Fits the `free` parameters to the seam by Gauss-Newton.
 ///
 /// Each round pairs the two ends of the sweep under the current geometry,
 /// measures how every pair's residual moves with each parameter (by finite
-/// differences: three more clouds), and takes the robust least-squares step,
+/// differences: one more cloud each), and takes the robust least-squares step,
 /// halved until it actually lowers the misfit of those same pairs. Each
 /// elevation band weighs the same in total, so the few pairs overhead -- the
 /// ceiling and whatever hangs from it -- count as much as the many below.
+#[allow(clippy::too_many_arguments)]
 fn refine_seam(
-    x0: [f64; 3],
+    x0: Params,
+    free: [bool; 4],
     span: f64,
     cloud: TrialCloud,
     platform: &[f32],
     progress: &dyn Fn(f64),
     cancelled: IsCancelled,
-) -> Result<[f64; 3], CalibError> {
+) -> Result<Params, CalibError> {
     const ROUNDS: usize = 8;
-    // Finite-difference steps, and the most one round may move: roll and tilt
-    // in degrees, spacing in mm.
-    let h = [0.05, 1.0, 0.1];
-    let max_step = [1.0, 10.0, 1.0];
-    let done = [0.002, 0.02, 0.002];
+    // Finite-difference steps, the most one round may move, and a step small
+    // enough to stop at: roll and tilt in degrees, spacing in mm, drift in mm
+    // per m^2 per minute.
+    let h = [0.05, 1.0, 0.1, 0.02];
+    let max_step = [1.0, 10.0, 1.0, 1.0];
+    let done = [0.002, 0.02, 0.002, 0.001];
+    // How far a scan may move each parameter from where it started before it
+    // has to show for it: a scan whose seam cannot tell one tilt from
+    // another (a narrow sweep, a near wall on one side) leaves the tilt where
+    // the last good calibration put it, while a clear seam outweighs this
+    // many times over.
+    let prior = [0.5, 10.0, 0.5, 1.0];
+    let prior_loss = |x: &Params| (0..4).filter(|&k| free[k]).map(|k| 0.5 * ((x[k] - x0[k]) / prior[k]).powi(2)).sum::<f64>();
+    let idx: Vec<usize> = (0..4).filter(|&k| free[k]).collect();
+    let nf = idx.len();
     let mut x = x0;
     for round in 0..ROUNDS {
         if cancelled() {
@@ -515,7 +534,7 @@ fn refine_seam(
         progress(round as f64 / ROUNDS as f64);
         let p = cloud(&x)?;
         let pairs = seam_pairs(&p, platform, span);
-        if pairs.len() < 100 {
+        if pairs.len() < 100 || nf == 0 {
             break;
         }
         let mut count = [0usize; SEAM_BANDS];
@@ -526,50 +545,54 @@ fn refine_seam(
         let w: Vec<f64> = pairs.iter().map(|s| bw[s.band as usize]).collect();
         let loss = |r: &[f64]| r.iter().zip(&w).map(|(r, w)| w * huber(*r)).sum::<f64>();
         let r0 = seam_residuals(&p, &pairs);
-        let mut jac = Vec::with_capacity(3);
-        for k in 0..3 {
+        let mut jac = Vec::with_capacity(nf);
+        for &k in &idx {
             let mut y = x;
             y[k] += h[k];
             let rk = seam_residuals(&cloud(&y)?, &pairs);
             jac.push(rk.iter().zip(&r0).map(|(a, b)| (a - b) / h[k]).collect::<Vec<f64>>());
         }
         // Iteratively reweighted least squares for the Huber loss.
-        let mut d = [0.0; 3];
+        let mut d = vec![0.0; nf];
         for _ in 0..6 {
-            let mut ata = [0.0; 9];
-            let mut atb = [0.0; 3];
+            let mut ata = vec![0.0; nf * nf];
+            let mut atb = vec![0.0; nf];
             for i in 0..r0.len() {
-                let e = r0[i] + (0..3).map(|k| jac[k][i] * d[k]).sum::<f64>();
+                let e = r0[i] + (0..nf).map(|k| jac[k][i] * d[k]).sum::<f64>();
                 let wi = w[i] * if e.abs() < HUBER { 1.0 } else { HUBER / e.abs() };
-                for k in 0..3 {
+                for k in 0..nf {
                     atb[k] -= wi * jac[k][i] * r0[i];
-                    for l in 0..3 {
-                        ata[k * 3 + l] += wi * jac[k][i] * jac[l][i];
+                    for l in 0..nf {
+                        ata[k * nf + l] += wi * jac[k][i] * jac[l][i];
                     }
                 }
             }
-            // A parameter the seam cannot see stays where it is.
-            for k in 0..3 {
-                ata[k * 3 + k] += 1e-9 * ata.iter().step_by(4).fold(0.0f64, |a, &b| a.max(b)).max(1e-30);
+            for (k, &j) in idx.iter().enumerate() {
+                let p = 1.0 / (prior[j] * prior[j]);
+                ata[k * nf + k] += p;
+                atb[k] -= p * (x[j] - x0[j]);
             }
-            let Some(s) = util::solve_dense(&ata, &atb, 3) else { break };
-            for k in 0..3 {
-                d[k] = s[k].clamp(-max_step[k], max_step[k]);
+            let Some(s) = util::solve_dense(&ata, &atb, nf) else { break };
+            for k in 0..nf {
+                d[k] = s[k].clamp(-max_step[idx[k]], max_step[idx[k]]);
             }
         }
-        let before = loss(&r0);
+        let before = loss(&r0) + prior_loss(&x);
         let mut t = 1.0;
         let mut moved = false;
         for _ in 0..5 {
-            let y = [x[0] + t * d[0], x[1] + t * d[1], x[2] + t * d[2]];
-            if loss(&seam_residuals(&cloud(&y)?, &pairs)) < before {
+            let mut y = x;
+            for (k, &j) in idx.iter().enumerate() {
+                y[j] += t * d[k];
+            }
+            if loss(&seam_residuals(&cloud(&y)?, &pairs)) + prior_loss(&y) < before {
                 x = y;
                 moved = true;
                 break;
             }
             t *= 0.5;
         }
-        if !moved || (0..3).all(|k| (t * d[k]).abs() < done[k]) {
+        if !moved || idx.iter().enumerate().all(|(k, &j)| (t * d[k]).abs() < done[j]) {
             break;
         }
     }
@@ -577,10 +600,47 @@ fn refine_seam(
     Ok(x)
 }
 
+/// Frames a drift fit works with: the seam needs no more density than this.
+const DRIFT_MAX_FRAMES: usize = 120_000;
+
+/// Measures how far the lidar's ranges drifted during one scan (mm per m^2
+/// per minute, for `Mount::range_drift`), from the seam, with the rig's
+/// calibration held fixed. 0 when the seam shows too little to tell.
+pub fn fit_range_drift(cap: &Capture, mount: &Mount, microstep: Option<&[f64]>) -> f64 {
+    let stride = cap.len().div_ceil(DRIFT_MAX_FRAMES).max(1);
+    let all_end = cap.samples.iter().all(|s| s.end_angle >= crate::protocol::RAW_ANGLE_MIN);
+    let thin;
+    let cap = if stride > 1 && all_end {
+        thin = cap.thinned(stride);
+        &thin
+    } else {
+        cap
+    };
+    let base = mount.clone();
+    let range = base.active_range_error().map(|r| r.to_vec());
+    let x0 = [base.lidar_rotation, base.emitter_spacing, base.scan_tilt, 0.0];
+    let cloud = |x: &Params| -> Result<(Vec<V3>, Vec<f32>), CalibError> {
+        let m = mount_with(&base, x, range.as_deref());
+        let c = geometry::build_cloud(cap, &m, microstep).map_err(|_| CalibError::NoSweep)?;
+        Ok((util::to_f64(&c.xyz), c.platform))
+    };
+    let Ok((_, plat)) = cloud(&x0) else { return 0.0 };
+    let span = plat.iter().fold(0.0f64, |a, &b| a.max((b as f64).abs()));
+    if span < 45.0 {
+        return 0.0;
+    }
+    let trial = |x: &Params| Ok(cloud(x)?.0);
+    match refine_seam(x0, [false, false, false, true], span, &trial, &plat, &|_| {}, &|| false) {
+        // Past this the "drift" is something else the seam is showing.
+        Ok(x) if x[3].is_finite() && x[3].abs() < 3.0 => x[3],
+        _ => 0.0,
+    }
+}
+
 /// Fits roll, spacing and tilt (and the range model around them) to one
 /// capture of an ordinary room.
 pub fn calibrate(cap: &Capture, base: &Mount, progress: Progress, cancelled: IsCancelled) -> Result<CalibResult, CalibError> {
-    let x0 = [base.lidar_rotation, base.emitter_spacing, base.scan_tilt];
+    let x0 = [base.lidar_rotation, base.emitter_spacing, base.scan_tilt, 0.0];
     let range_start: Option<Vec<f64>> = base.active_range_error().map(|r| r.to_vec());
 
     // Long sweeps are thinned: density past ~120k frames buys nothing.
@@ -605,13 +665,13 @@ pub fn calibrate(cap: &Capture, base: &Mount, progress: Progress, cancelled: IsC
         return Err(CalibError::Cancelled);
     }
 
-    let fit_range = |x: &[f64; 3]| -> Result<Option<Vec<f64>>, CalibError> {
+    let fit_range = |x: &Params| -> Result<Option<Vec<f64>>, CalibError> {
         let fitted = fit_range_error(cap, base, x, micro, cancelled).map_err(|_| CalibError::Cancelled)?;
         Ok(fitted.or_else(|| range_start.clone()))
     };
 
     // Point clouds under a trial geometry, with the shaft angle of each point.
-    let cloud = |x: &[f64; 3], range: Option<&[f64]>| -> Result<(Vec<V3>, Vec<f32>), CalibError> {
+    let cloud = |x: &Params, range: Option<&[f64]>| -> Result<(Vec<V3>, Vec<f32>), CalibError> {
         let m = mount_with(base, x, range);
         let c = geometry::build_cloud(cap, &m, micro).map_err(|_| CalibError::NoSweep)?;
         Ok((util::to_f64(&c.xyz), c.platform))
@@ -630,7 +690,7 @@ pub fn calibrate(cap: &Capture, base: &Mount, progress: Progress, cancelled: IsC
         return Err(CalibError::NoPlanes);
     }
 
-    let detail = |x: &[f64; 3], range: Option<&[f64]>| -> Result<Scores, CalibError> {
+    let detail = |x: &Params, range: Option<&[f64]>| -> Result<Scores, CalibError> {
         let (p, plat) = cloud(x, range)?;
         let mut s = seam_score(&p, &plat, span);
         s.planes = plane_score(&p, &planes);
@@ -638,8 +698,11 @@ pub fn calibrate(cap: &Capture, base: &Mount, progress: Progress, cancelled: IsC
     };
     let before = detail(&x0, range_start.as_deref())?;
 
-    let seam_cloud = |x: &[f64; 3]| -> Result<Vec<V3>, CalibError> { Ok(cloud(x, range_now.as_deref())?.0) };
-    let x = refine_seam(x0, span, &seam_cloud, &plat0, &|f| progress(Stage::Seam, 0.05 + 0.9 * f), cancelled)?;
+    let seam_cloud = |x: &Params| -> Result<Vec<V3>, CalibError> { Ok(cloud(x, range_now.as_deref())?.0) };
+    // The scan's own range drift is fitted alongside: left out, it would be
+    // taken up by the tilt and the spacing, and the rig would be calibrated
+    // to one scan's warm-up.
+    let x = refine_seam(x0, [true; 4], span, &seam_cloud, &plat0, &|f| progress(Stage::Seam, 0.05 + 0.9 * f), cancelled)?;
     progress(Stage::RangeRefit, 0.96);
     range_now = fit_range(&x)?;
     let after = detail(&x, range_now.as_deref())?;
@@ -648,6 +711,7 @@ pub fn calibrate(cap: &Capture, base: &Mount, progress: Progress, cancelled: IsC
         rotation: x[0],
         spacing: x[1],
         tilt: x[2],
+        range_drift: x[3],
         range_at_3m_before: geometry::range_error_at(range_start.as_deref(), 3000.0),
         range_at_3m_after: geometry::range_error_at(range_now.as_deref(), 3000.0),
         range_error: range_now,
@@ -700,19 +764,24 @@ mod tests {
         t
     }
 
-    /// A +-`span` sweep of that room by a rig bolted together as `m`.
-    fn synthetic(m: &Mount, span: f64) -> Capture {
+    /// A ten-minute +-`span` sweep of that room by a rig bolted together as
+    /// `m`, whose ranges drift by `drift` mm per m^2 per minute.
+    fn synthetic(m: &Mount, span: f64, drift: f64) -> Capture {
         let (st, ct) = m.scan_tilt.to_radians().sin_cos();
         let mut cap = Capture::new();
         let step = 0.5;
         let frame = POINTS as f64 * step;
         let revs = (2.0 * span / step) as usize;
+        let frames = (360.0 / frame) as usize;
+        let frame_us = 600e6 / ((revs + 1) * frames) as f64;
         for r in 0..=revs {
             let plat = -span + r as f64 * step;
             let (sy, cy) = plat.to_radians().sin_cos();
             let yaw = |v: V3| [cy * v[0] - sy * v[1], sy * v[0] + cy * v[1], v[2]];
-            for f in 0..(360.0 / frame) as usize {
+            for f in 0..frames {
                 let a0 = f as f64 * frame;
+                let t_us = ((r * frames + f) as f64 * frame_us) as u32;
+                let minutes = t_us as f64 / 60e6 - 5.0;
                 let mut dist = [0u16; POINTS];
                 for (i, d) in dist.iter_mut().enumerate() {
                     let az = a0 + i as f64 * step;
@@ -722,11 +791,12 @@ mod tests {
                     let tilt = |v: V3| [v[0], ct * v[1] - st * v[2], st * v[1] + ct * v[2]];
                     let o = yaw(tilt([b * c, 0.0, -b * s]));
                     let u = yaw(tilt([s, 0.0, c]));
-                    *d = trace(o, u).round().min(8000.0) as u16;
+                    let t = trace(o, u);
+                    *d = (t + drift * minutes * (t * 1e-3).powi(2)).round().min(8000.0) as u16;
                 }
                 let raw = |deg: f64| RAW_ANGLE_MIN + (deg * RAW_PER_DEG).round() as u16;
                 cap.samples.push(Sample {
-                    t_us: 0,
+                    t_us,
                     platform: plat as f32,
                     speed: 0,
                     raw_angle: raw(a0),
@@ -748,22 +818,40 @@ mod tests {
         truth.range_correction = false;
         // As wide as the automatic sweep gets: the seam is a broad band, not
         // the last few degrees at each end.
-        let cap = synthetic(&truth, 110.0);
-        let cloud = |x: &[f64; 3]| -> Result<(Vec<V3>, Vec<f32>), CalibError> {
+        let cap = synthetic(&truth, 110.0, 0.0);
+        let cloud = |x: &Params| -> Result<(Vec<V3>, Vec<f32>), CalibError> {
             let c = geometry::build_cloud(&cap, &mount_with(&truth, x, None), None).map_err(|_| CalibError::NoSweep)?;
             Ok((util::to_f64(&c.xyz), c.platform))
         };
-        let (_, plat) = cloud(&[161.5, -33.0, 0.0]).unwrap();
+        // From the reference build's nominal values, as a new rig starts.
+        let start = [161.65, -36.5, -1.2, 0.0];
+        let (_, plat) = cloud(&start).unwrap();
         let span = plat.iter().fold(0.0f64, |a, &b| a.max((b as f64).abs()));
-        let trial = |x: &[f64; 3]| Ok(cloud(x)?.0);
-        let x = refine_seam([161.5, -33.0, 0.0], span, &trial, &plat, &|_| {}, &|| false).unwrap();
+        let trial = |x: &Params| Ok(cloud(x)?.0);
+        let x = refine_seam(start, [true, true, true, false], span, &trial, &plat, &|_| {}, &|| false).unwrap();
         assert!((x[0] - 161.9).abs() < 0.05, "roll {x:?}");
         assert!((x[1] + 38.0).abs() < 1.0, "spacing {x:?}");
         assert!((x[2] + 1.6).abs() < 0.05, "tilt {x:?}");
         // The seam score sees the whole overlap: well apart before, together after.
-        let (p0, _) = cloud(&[161.5, -33.0, 0.0]).unwrap();
+        let (p0, _) = cloud(&start).unwrap();
         let (p1, _) = cloud(&x).unwrap();
         let (s0, s1) = (seam_score(&p0, &plat, span), seam_score(&p1, &plat, span));
-        assert!(s0.horizon > 2.0 && s1.horizon < 1.0, "{s0:?} -> {s1:?}");
+        assert!(s0.up > 2.0 && s1.up < 1.0, "{s0:?} -> {s1:?}");
+    }
+
+    #[test]
+    fn drift_fit_recovers_the_warm_up() {
+        let mut truth = Mount::default();
+        truth.lidar_rotation = 161.9;
+        truth.emitter_spacing = -38.0;
+        truth.scan_tilt = -1.6;
+        truth.range_correction = false;
+        let cap = synthetic(&truth, 100.0, 0.3);
+        let rate = fit_range_drift(&cap, &truth, None);
+        assert!((rate - 0.3).abs() < 0.03, "drift {rate}");
+        // And a scan that did not drift is left alone.
+        let still = synthetic(&truth, 100.0, 0.0);
+        let rate = fit_range_drift(&still, &truth, None);
+        assert!(rate.abs() < 0.03, "drift {rate}");
     }
 }

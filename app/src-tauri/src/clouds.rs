@@ -2,9 +2,9 @@
 //!
 //! A scan's cloud is always rebuilt from its raw stream with the current
 //! mount geometry, so calibration changes apply to every scan. Building is
-//! tens of milliseconds, the microstep fit a little more (and its result is
-//! kept in the library), so the cache is only there to make re-selecting,
-//! merging and exporting instant.
+//! tens of milliseconds, the microstep and drift fits a little more (their
+//! results are kept in the library), so the cache is only there to make
+//! re-selecting, merging and exporting instant.
 
 use std::sync::Arc;
 
@@ -13,7 +13,8 @@ use rayon::prelude::*;
 use crate::capture::Capture;
 use crate::export;
 use crate::geometry::{self, Mount};
-use crate::library::{ScanKind, ScanMeta};
+use crate::calibration;
+use crate::library::{DriftFit, ScanKind, ScanMeta};
 use crate::util::Rng;
 
 pub struct CloudEntry {
@@ -114,11 +115,32 @@ impl CloudEntry {
     }
 }
 
-/// What building a scan produced, including a microstep fit worth keeping.
+/// What building a scan produced, including fits worth keeping.
 pub struct Built {
     pub entry: CloudEntry,
-    pub new_microstep: Option<Vec<f64>>,
+    pub fits: NewFits,
     pub capture_points: usize,
+}
+
+/// Fits made while building a scan, for its library entry.
+#[derive(Default)]
+pub struct NewFits {
+    pub microstep: Option<Vec<f64>>,
+    pub drift: Option<DriftFit>,
+}
+
+impl NewFits {
+    /// Writes the fresh fits into the scan's library entry; true if any.
+    pub fn store(self, meta: &mut ScanMeta) -> bool {
+        let changed = self.microstep.is_some() || self.drift.is_some();
+        if let Some(c) = self.microstep {
+            meta.microstep = Some(c);
+        }
+        if let Some(d) = self.drift {
+            meta.range_drift = Some(d);
+        }
+        changed
+    }
 }
 
 /// Builds a scan's cloud from its file.
@@ -130,7 +152,7 @@ pub fn build_scan(meta: &ScanMeta, path: &std::path::Path, mount: &Mount) -> Res
             let n = xyz.len();
             let platform: Vec<f32> = xyz.par_iter().map(|p| p[1].atan2(p[0]).to_degrees()).collect();
             let entry = CloudEntry::new(meta.id.clone(), 0, xyz, dist, platform, rgb, 180.0);
-            Ok(Built { entry, new_microstep: None, capture_points: n })
+            Ok(Built { entry, fits: NewFits::default(), capture_points: n })
         }
         ScanKind::Device | ScanKind::Bin => {
             let data = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -154,7 +176,22 @@ pub fn build_capture(meta: &ScanMeta, cap: &Capture, mount: &Mount) -> Result<Bu
     } else {
         None
     };
-    let cloud = geometry::build_cloud(cap, mount, coef.as_deref()).map_err(|e| e.to_string())?;
+    // The lidar's ranges drift as it warms up; each scan's drift is measured
+    // from its own seam, under the calibration in force.
+    let mut m = mount.clone();
+    let mut new_drift = None;
+    if mount.drift_auto {
+        let key = format!("{:016x}", mount.fingerprint());
+        m.range_drift = match &meta.range_drift {
+            Some(d) if d.mount == key => d.rate,
+            _ => {
+                let rate = calibration::fit_range_drift(cap, mount, coef.as_deref());
+                new_drift = Some(DriftFit { rate, mount: key });
+                rate
+            }
+        };
+    }
+    let cloud = geometry::build_cloud(cap, &m, coef.as_deref()).map_err(|e| e.to_string())?;
     let sweep = cap
         .config
         .map(|c| c.degrees as f32)
@@ -162,7 +199,7 @@ pub fn build_capture(meta: &ScanMeta, cap: &Capture, mount: &Mount) -> Result<Bu
         .unwrap_or_else(|| cloud.platform.iter().fold(1.0f32, |a, &b| a.max(b.abs())));
     let n = cloud.len();
     let entry = CloudEntry::new(meta.id.clone(), mount.fingerprint(), cloud.xyz, cloud.dist, cloud.platform, None, sweep);
-    Ok(Built { entry, new_microstep, capture_points: n })
+    Ok(Built { entry, fits: NewFits { microstep: new_microstep, drift: new_drift }, capture_points: n })
 }
 
 /// Small LRU of built clouds, bounded by total points.

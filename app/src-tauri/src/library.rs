@@ -48,10 +48,21 @@ pub struct ScanMeta {
     /// Cached microstep fit for this scan.
     #[serde(default)]
     pub microstep: Option<Vec<f64>>,
+    /// Cached range drift fit for this scan.
+    #[serde(default)]
+    pub range_drift: Option<DriftFit>,
     #[serde(default)]
     pub source_name: Option<String>,
     #[serde(default)]
     pub bytes: u64,
+}
+
+/// A scan's range drift (mm per m^2 per minute, see geometry::correct_drift)
+/// and the mount it was measured under: a new calibration measures it again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DriftFit {
+    pub rate: f64,
+    pub mount: String,
 }
 
 fn yes() -> bool {

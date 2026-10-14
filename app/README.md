@@ -78,7 +78,8 @@ Scans are kept automatically, the way a photo library keeps photos:
 
 ```
 Documents/XScan3D/
-  library.json        names, merge groups, poses, the microstep fit per scan
+  library.json        names, merge groups, poses, the microstep and range
+                      drift fits per scan
   scans/<id>.bin      the raw stream, exactly as the device sent it
   scans/<id>.bin.part a scan still recording; recovered on the next start
   thumbs/<id>.png     thumbnails the viewer renders

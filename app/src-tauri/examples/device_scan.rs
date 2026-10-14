@@ -85,6 +85,7 @@ fn main() {
                             cap.config = Some(c);
                         }
                         Record::Event(e) => println!("[mcu] {e}"),
+                        Record::Calib(_) => {}
                     }
                 }
             }
@@ -129,6 +130,7 @@ fn main() {
         group: None,
         pose: identity4(),
         microstep: None,
+        range_drift: None,
         source_name: None,
         bytes: raw.len() as u64,
     };
@@ -137,7 +139,7 @@ fn main() {
         "--- final cloud: {} points in {:.2}s (microstep {}), sweep {:.1}s, ceiling {:?}",
         built.entry.len(),
         t.elapsed().as_secs_f64(),
-        if built.new_microstep.is_some() { "fitted" } else { "none" },
+        if built.fits.microstep.is_some() { "fitted" } else { "none" },
         cap.sweep_seconds(),
         built.entry.ceiling,
     );

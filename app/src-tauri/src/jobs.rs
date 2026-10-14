@@ -556,13 +556,14 @@ pub fn import_files(core: &CoreRef, paths: &[String]) -> (Vec<String>, Vec<Strin
             group: None,
             pose: util::identity4(),
             microstep: None,
+            range_drift: None,
             source_name: src.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()),
             bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
         };
         match clouds::build_scan(&meta, &dst, &mount) {
             Ok(b) if b.entry.len() > 0 => {
                 meta.points = b.entry.len();
-                meta.microstep = b.new_microstep;
+                b.fits.store(&mut meta);
                 if kind == ScanKind::Bin {
                     if let Ok(data) = std::fs::read(&dst) {
                         let cap = Capture::from_bytes(&data);

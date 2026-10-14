@@ -155,8 +155,8 @@ impl Core {
         new
     }
 
-    /// The built cloud of a scan: from the cache, else built now. A fresh
-    /// microstep fit is written back to the library.
+    /// The built cloud of a scan: from the cache, else built now. Fresh
+    /// microstep and drift fits are written back to the library.
     pub fn cloud(&self, id: &str) -> Result<Arc<CloudEntry>, String> {
         let mount = self.settings.read().mount.clone();
         let fp = mount.fingerprint();
@@ -175,10 +175,7 @@ impl Core {
         {
             let mut lib = self.library.lock();
             if let Some(m) = lib.get_mut(id) {
-                if let Some(c) = built.new_microstep {
-                    m.microstep = Some(c);
-                    changed = true;
-                }
+                changed |= built.fits.store(m);
                 if m.points != entry.len() {
                     m.points = entry.len();
                     changed = true;
@@ -243,13 +240,14 @@ impl Core {
                 group: None,
                 pose: crate::util::identity4(),
                 microstep: None,
+                range_drift: None,
                 source_name: None,
                 bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             };
             match clouds::build_scan(&meta, &path, &mount) {
                 Ok(b) if b.entry.len() > 0 => {
                     meta.points = b.entry.len();
-                    meta.microstep = b.new_microstep;
+                    b.fits.store(&mut meta);
                     if kind != ScanKind::Ply {
                         if let Ok(data) = std::fs::read(&path) {
                             let cap = crate::capture::Capture::from_bytes(&data);

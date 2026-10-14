@@ -17,6 +17,7 @@ export interface Mount {
   minRange: number;
   maxRange: number;
   microstepAuto: boolean;
+  driftAuto: boolean;
   rangeCorrection: boolean;
   rangeError: number[] | null;
 }

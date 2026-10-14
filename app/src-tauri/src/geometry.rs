@@ -58,11 +58,19 @@ pub struct Mount {
     /// 0 = no limit.
     pub max_range: f64,
     pub microstep_auto: bool,
+    /// Measure each scan's range drift from its seam and take it out (see
+    /// `range_drift`).
+    pub drift_auto: bool,
     /// Apply the lidar's range non-linearity model below.
     pub range_correction: bool,
     /// (T, p, E, d_lo, d_hi, coefficients...), see `correct_range`. None when
     /// the lidar has not been calibrated.
     pub range_error: Option<Vec<f64>>,
+    /// How fast the lidar's ranges drifted during this scan, in mm per m^2
+    /// per minute. Belongs to one scan, not to the rig: whoever builds a scan
+    /// sets it, and it is neither stored nor sent to the device.
+    #[serde(skip)]
+    pub range_drift: f64,
 }
 
 /// The range model fitted to scans/room.bin (scan_proto.RANGE_ERROR).
@@ -88,8 +96,10 @@ impl Default for Mount {
             min_range: 60.0,
             max_range: 0.0,
             microstep_auto: true,
+            drift_auto: true,
             range_correction: true,
             range_error: Some(default_range_error()),
+            range_drift: 0.0,
         }
     }
 }
@@ -216,6 +226,41 @@ pub fn range_error_at(model: Option<&[f64]>, d_mm: f64) -> f64 {
     best
 }
 
+// --- Range drift -------------------------------------------------------------
+//
+// The rangefinder warms up while it works, and a triangulation sensor that
+// warms shifts its spot on the pixel row a little. A shift in pixels is a
+// shift in u = 1e6 / d, so the range moves by about d^2 du: nothing at half a
+// metre, tens of millimetres at three. Over a sweep of several minutes the two
+// ends then disagree on every far surface, while the near ones still match.
+// Modelled as linear in time, centred on the middle of the sweep:
+//
+//     d' = d - rate * (t - t_mid) / 60 s * (d / 1 m)^2
+
+/// Range drift correction of a reading `d` (mm) taken `minutes` from the
+/// middle of the sweep.
+#[inline]
+pub fn correct_drift(d: f64, rate: f64, minutes: f64) -> f64 {
+    let k = d * 1e-3;
+    d - rate * minutes * k * k
+}
+
+/// Minutes from the middle of the sweep, per sample. micros() wraps every 71
+/// minutes, so times are taken relative to the first sample.
+pub fn sample_minutes(cap: &Capture) -> Vec<f64> {
+    let Some(first) = cap.samples.iter().find(|s| s.capturing).or(cap.samples.first()) else { return Vec::new() };
+    let t0 = first.t_us;
+    let t: Vec<f64> = cap.samples.iter().map(|s| s.t_us.wrapping_sub(t0) as f64 / 60e6).collect();
+    let (lo, hi) = cap
+        .samples
+        .iter()
+        .zip(&t)
+        .filter(|(s, _)| s.capturing)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, &v)| (lo.min(v), hi.max(v)));
+    let mid = if lo <= hi { 0.5 * (lo + hi) } else { 0.0 };
+    t.iter().map(|v| v - mid).collect()
+}
+
 #[derive(Debug)]
 pub enum GeomError {
     TooFewSamples(usize),
@@ -324,6 +369,7 @@ pub fn mount_points(cap: &Capture, m: &Mount, half: ScanHalf) -> Result<MountPoi
     }
     let (sin_tilt, cos_tilt) = m.scan_tilt.to_radians().sin_cos();
     let model = m.active_range_error();
+    let minutes = if m.range_drift != 0.0 { sample_minutes(cap) } else { Vec::new() };
     let mm = keep.len();
     let mut p = vec![[0.0; 3]; mm * POINTS];
     let mut good = vec![false; mm * POINTS];
@@ -341,7 +387,10 @@ pub fn mount_points(cap: &Capture, m: &Mount, half: ScanHalf) -> Result<MountPoi
                 let az = ang[k] + width[k] * (i as f64 / (POINTS as f64 - 1.0));
                 let raw = s.dist[i];
                 // The lidar's own range non-linearity, before anything uses it.
-                let d = correct_range((raw & DIST_MASK) as f64, model);
+                let mut d = correct_range((raw & DIST_MASK) as f64, model);
+                if m.range_drift != 0.0 {
+                    d = correct_drift(d, m.range_drift, minutes[k]);
+                }
                 let (pt, sin_th) = mount_point(d, az, m, sin_tilt, cos_tilt);
                 pc[i] = pt;
                 dc[i] = d;
