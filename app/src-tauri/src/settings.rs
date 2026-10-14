@@ -77,7 +77,7 @@ impl Default for ViewSettings {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MeshSettings {
-    /// Off by default: the surface tools stay out of the way until wanted.
+    /// On by default: the Surface button and mesh export are shown.
     pub enabled: bool,
     /// "medium" | "high" | "max"
     pub quality: String,
@@ -89,7 +89,7 @@ pub struct MeshSettings {
 
 impl Default for MeshSettings {
     fn default() -> Self {
-        MeshSettings { enabled: false, quality: "high".into(), trim: 3.0, budget: 2_500_000, smooth: 0 }
+        MeshSettings { enabled: true, quality: "high".into(), trim: 3.0, budget: 2_500_000, smooth: 0 }
     }
 }
 
