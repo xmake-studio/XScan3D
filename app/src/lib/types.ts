@@ -27,12 +27,38 @@ export interface Settings {
   theme: ThemePref;
   libraryDir: string | null;
   scan: { duration: number; startDelay: number; stepped: boolean; dwellMs: number; sweepDeg: number };
-  device: { autoConnect: boolean; dtr: boolean; knownSerials: string[]; calibPending: boolean };
+  device: {
+    autoConnect: boolean;
+    dtr: boolean;
+    knownSerials: string[];
+    calibPending: boolean;
+    /** Every scanner seen, by chip serial, with its calibration as last known. */
+    scanners: Record<string, ScannerRecord>;
+    /** The scanner `mount` describes: the one connected, else the last one. */
+    active: string | null;
+  };
   mount: Mount;
   view: { colorMode: ColorMode; pointSize: number; grid: boolean; edl: boolean; camera: CamMode; flySpeed: number };
   mesh: { enabled: boolean; quality: Quality; trim: number; budget: number; smooth: number };
   merge: { mode: "auto" | "small" | "hint"; yawHint: number; voxel: number; ignoreFoliage: boolean };
   flyHintSeen: boolean;
+}
+
+/** The hardware part of a mount, as one scanner stores it. */
+export interface DeviceCalib {
+  v: number;
+  lidarRotation: number;
+  lidarReverse: boolean;
+  emitterSpacing: number;
+  scanTilt: number;
+  flipUpright: boolean;
+  beamOffset: number;
+  rangeError: number[] | null;
+}
+
+export interface ScannerRecord {
+  calib: DeviceCalib;
+  pending: boolean;
 }
 
 export type ScanKind = "device" | "bin" | "ply";
@@ -50,6 +76,8 @@ export interface ScanMeta {
   group: string | null;
   pose: number[];
   microstep: number[] | null;
+  /** Chip serial of the scanner that took it; null when not known. */
+  scanner: string | null;
   sourceName: string | null;
   bytes: number;
 }
@@ -171,6 +199,12 @@ export interface CalibResult {
   rotation: number;
   spacing: number;
   tilt: number;
+  rotationBefore: number;
+  spacingBefore: number;
+  tiltBefore: number;
+  /** The scanner whose scan was calibrated on; the fit is for it. */
+  scanner: string | null;
+  rangeDrift: number;
   rangeError: number[] | null;
   rangeErrorBefore: number[] | null;
   rangeAt3mBefore: number;

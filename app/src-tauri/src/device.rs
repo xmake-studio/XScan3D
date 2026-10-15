@@ -451,6 +451,7 @@ fn run_link(
 /// auto-connect finds it even without the product string.
 fn remember_serial(core: &CoreRef, serial: Option<&str>) {
     let Some(s) = serial else { return };
+    core.activate_scanner(s);
     let known = core.settings.read().device.known_serials.clone();
     if !known.iter().any(|k| k == s) {
         let mut k = known;

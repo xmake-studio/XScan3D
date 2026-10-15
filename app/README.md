@@ -78,8 +78,8 @@ Scans are kept automatically, the way a photo library keeps photos:
 
 ```
 Documents/XScan3D/
-  library.json        names, merge groups, poses, the microstep and range
-                      drift fits per scan
+  library.json        names, merge groups, poses, the scanner that took each
+                      scan, its microstep and range drift fits
   scans/<id>.bin      the raw stream, exactly as the device sent it
   scans/<id>.bin.part a scan still recording; recovered on the next start
   thumbs/<id>.png     thumbnails the viewer renders
@@ -87,7 +87,9 @@ Documents/XScan3D/
 
 Because the raw stream is the stored form, every scan is rebuilt from it with
 the current calibration — recalibrating fixes every scan you already took,
-and nothing is ever baked in.
+and nothing is ever baked in. The settings keep every scanner's calibration
+by chip serial, and each scan is rebuilt with the calibration of the scanner
+that took it, whichever one is plugged in.
 
 ## Wire formats between the core and the viewer
 

@@ -13,7 +13,7 @@ const DEFAULT_SETTINGS: Settings = {
   theme: "system",
   libraryDir: null,
   scan: { duration: 180, startDelay: 0, stepped: false, dwellMs: 400, sweepDeg: 0 },
-  device: { autoConnect: true, dtr: true, knownSerials: [], calibPending: false },
+  device: { autoConnect: true, dtr: true, knownSerials: [], calibPending: false, scanners: {}, active: null },
   mount: {
     lidarRotation: 161.65, lidarReverse: true, emitterSpacing: -36.5, scanTilt: -1.2, scanHalf: "both",
     flipUpright: false, beamOffset: 0, minRange: 60, maxRange: 0, microstepAuto: true, driftAuto: true, rangeCorrection: true,
@@ -24,6 +24,20 @@ const DEFAULT_SETTINGS: Settings = {
   merge: { mode: "auto", yawHint: 0, voxel: 40, ignoreFoliage: true },
   flyHintSeen: false,
 };
+
+// Two scanners, as on a desk with a spare: the mock device is the first.
+{
+  const m = DEFAULT_SETTINGS.mount;
+  const calib = (rotation: number, tilt: number) => ({
+    v: 1, lidarRotation: rotation, lidarReverse: m.lidarReverse, emitterSpacing: m.emitterSpacing, scanTilt: tilt,
+    flipUpright: m.flipUpright, beamOffset: m.beamOffset, rangeError: m.rangeError,
+  });
+  DEFAULT_SETTINGS.device.scanners = {
+    E6600000DEADBEEF: { calib: calib(m.lidarRotation, m.scanTilt), pending: false },
+    E66141040B2A9C02: { calib: calib(162.59, -0.25), pending: false },
+  };
+  DEFAULT_SETTINGS.device.active = "E6600000DEADBEEF";
+}
 
 export function mockBackend(): Backend {
   const handlers = new Map<string, Set<Handler>>();
@@ -52,8 +66,10 @@ export function mockBackend(): Backend {
     library.index.scans = manifest.scans.map((s): ScanMeta => ({
       id: s.id, name: null, created: s.created, kind: "device", file: `scans/${s.id}.bin`, points: s.points,
       duration: s.duration, sweepDeg: 90, complete: true, group: null,
-      pose: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], microstep: null, sourceName: null, bytes: s.points * 5,
+      pose: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], microstep: null, scanner: null, sourceName: null, bytes: s.points * 5,
     }));
+    const first = library.index.scans[0];
+    if (first) first.scanner = settings.device.active;
   };
 
   setTimeout(() => {
@@ -216,6 +232,10 @@ export function mockBackend(): Backend {
       library.index.scans = library.index.scans.filter((s) => !drop.has(s.id));
       emit("library", structuredClone(library));
     },
+    async scansSetScanner(ids, scanner) {
+      for (const s of library.index.scans) if (ids.includes(s.id) || (s.group && ids.includes(s.group))) s.scanner = scanner;
+      emit("library", structuredClone(library));
+    },
     async scansUngroup(ids) {
       for (const s of library.index.scans) if (ids.includes(s.id) || (s.group && ids.includes(s.group))) s.group = null;
       library.index.groups = library.index.groups.filter((g) => library.index.scans.filter((s) => s.group === g.id).length >= 2);
@@ -297,16 +317,26 @@ export function mockBackend(): Backend {
     async meshData() {
       return (await fetch("/dev-assets/mesh.xsm")).arrayBuffer();
     },
-    async calibrateStart() {
+    async calibrateStart(id) {
+      const serial = library.index.scans.find((x) => x.id === id)?.scanner ?? settings.device.active;
+      const rec = serial ? settings.device.scanners[serial] : undefined;
+      const from = rec && serial !== settings.device.active
+        ? { r: rec.calib.lidarRotation, s: rec.calib.emitterSpacing, t: rec.calib.scanTilt }
+        : { r: settings.mount.lidarRotation, s: settings.mount.emitterSpacing, t: settings.mount.scanTilt };
       const stages = ["microstep", "range", "planes", "seam", "rangeRefit"] as const;
       stages.forEach((s, i) => setTimeout(() => emit("calib", { kind: "progress", stage: s, fraction: (i + 1) / 6 }), i * 600));
       setTimeout(() => emit("calib", {
         kind: "done", scan: "x",
-        result: { rotation: 161.96, spacing: -38.69, tilt: -1.22, rangeError: settings.mount.rangeError, rangeErrorBefore: settings.mount.rangeError, rangeAt3mBefore: 7.81, rangeAt3mAfter: 7.76, before: { planes: 2.01, up: 8.56, horizon: 1.66, down: 0.49 }, after: { planes: 1.79, up: 1.87, horizon: 1.67, down: 0.75 }, stride: 2 },
+        result: { rotation: 161.96, spacing: -38.69, tilt: -1.22, rotationBefore: from.r, spacingBefore: from.s, tiltBefore: from.t, scanner: serial, rangeDrift: 0.1, rangeError: settings.mount.rangeError, rangeErrorBefore: settings.mount.rangeError, rangeAt3mBefore: 7.81, rangeAt3mAfter: 7.76, before: { planes: 2.01, up: 8.56, horizon: 1.66, down: 0.49 }, after: { planes: 1.79, up: 1.87, horizon: 1.67, down: 0.75 }, stride: 2 },
       }), 3200);
     },
     async calibrateCancel() {},
     async calibrateApply(fit) {
+      const rec = fit.scanner ? settings.device.scanners[fit.scanner] : undefined;
+      if (rec && fit.scanner !== settings.device.active) {
+        const calib = { ...rec.calib, lidarRotation: fit.rotation, emitterSpacing: fit.spacing, scanTilt: fit.tilt };
+        return b.settingsUpdate({ device: { scanners: { ...settings.device.scanners, [fit.scanner!]: { calib, pending: true } } } });
+      }
       return b.settingsUpdate({ mount: { lidarRotation: fit.rotation, emitterSpacing: fit.spacing, scanTilt: fit.tilt } });
     },
     async on(event, fn) {

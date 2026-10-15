@@ -131,6 +131,7 @@ fn main() {
         pose: identity4(),
         microstep: None,
         range_drift: None,
+        scanner: None,
         source_name: None,
         bytes: raw.len() as u64,
     };

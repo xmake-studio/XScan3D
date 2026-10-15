@@ -127,6 +127,7 @@ impl Core {
                 new.device.calib_pending = true;
                 local_calib = true;
             }
+            new.sync_active_scanner();
             *s = new.clone();
             (old, new)
         };
@@ -134,7 +135,7 @@ impl Core {
         if local_calib {
             devcalib::on_local_change(self);
         }
-        if old.mount != new.mount {
+        if old.mount != new.mount || old.calibrations_differ(&new) {
             self.clouds.lock().clear_raw();
             *self.mesh.lock() = None;
             let v = self.geometry_version.fetch_add(1, Ordering::SeqCst) + 1;
@@ -155,20 +156,52 @@ impl Core {
         new
     }
 
+    /// Makes `serial` the scanner the settings' calibration describes, once
+    /// the board on the link has shown it is the scanner. The last scanner's
+    /// calibration stays in its record, for its scans.
+    pub fn activate_scanner(&self, serial: &str) {
+        let patch = {
+            let s = self.settings.read();
+            if s.device.active.as_deref() == Some(serial) {
+                return;
+            }
+            match s.device.scanners.get(serial) {
+                // The first scanner since scanners were told apart: what the
+                // settings hold is its calibration, pending change and all.
+                _ if s.device.active.is_none() => serde_json::json!({ "device": { "active": serial } }),
+                Some(r) => {
+                    let mut p = r.calib.mount_patch();
+                    p["device"] = serde_json::json!({ "active": serial, "calibPending": r.pending });
+                    p
+                }
+                // Never seen: what it holds decides (devcalib.rs), and it is
+                // owed nothing the last scanner was waiting for.
+                None => serde_json::json!({ "device": { "active": serial, "calibPending": false } }),
+            }
+        };
+        log::info(&format!("scanner {serial} is now the active one"));
+        self.update_settings_from_device(&patch);
+    }
+
+    /// The mount a scan is built with: its own scanner's calibration.
+    pub fn mount_for(&self, meta: &ScanMeta) -> crate::geometry::Mount {
+        self.settings.read().mount_for(meta.scanner.as_deref())
+    }
+
     /// The built cloud of a scan: from the cache, else built now. Fresh
     /// microstep and drift fits are written back to the library.
     pub fn cloud(&self, id: &str) -> Result<Arc<CloudEntry>, String> {
-        let mount = self.settings.read().mount.clone();
-        let fp = mount.fingerprint();
-        if let Some(e) = self.clouds.lock().get(id, fp) {
-            return Ok(e);
-        }
         let (meta, path) = {
             let lib = self.library.lock();
             let meta = lib.get(id).cloned().ok_or_else(|| format!("unknown scan {id}"))?;
             let path = lib.path_of(&meta);
             (meta, path)
         };
+        let mount = self.mount_for(&meta);
+        let fp = mount.fingerprint();
+        if let Some(e) = self.clouds.lock().get(id, fp) {
+            return Ok(e);
+        }
         let built = clouds::build_scan(&meta, &path, &mount)?;
         let entry = Arc::new(built.entry);
         let mut changed = false;
@@ -241,6 +274,7 @@ impl Core {
                 pose: crate::util::identity4(),
                 microstep: None,
                 range_drift: None,
+                scanner: None,
                 source_name: None,
                 bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             };

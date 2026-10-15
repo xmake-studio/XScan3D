@@ -1,10 +1,12 @@
 //! Persistent settings, one JSON file in the app's config directory. Every
 //! section defaults sensibly, so a missing or older file just fills in.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::devcalib::DeviceCalib;
 use crate::geometry::Mount;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -40,12 +42,35 @@ pub struct DeviceSettings {
     /// storing it yet (see devcalib.rs). Persisted, so a change made with the
     /// scanner unplugged still reaches it on the next connect.
     pub calib_pending: bool,
+    /// Every scanner this app has worked with, by chip serial, with its
+    /// calibration as last known: each scan is rebuilt with the calibration
+    /// of the scanner that took it, whichever one is plugged in.
+    pub scanners: BTreeMap<String, ScannerRecord>,
+    /// The scanner `mount` and `calib_pending` describe: the one connected,
+    /// else the last one that was.
+    pub active: Option<String>,
 }
 
 impl Default for DeviceSettings {
     fn default() -> Self {
-        DeviceSettings { auto_connect: true, dtr: true, known_serials: Vec::new(), calib_pending: false }
+        DeviceSettings {
+            auto_connect: true,
+            dtr: true,
+            known_serials: Vec::new(),
+            calib_pending: false,
+            scanners: BTreeMap::new(),
+            active: None,
+        }
     }
+}
+
+/// One scanner's calibration, kept for its scans while it is unplugged.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ScannerRecord {
+    pub calib: DeviceCalib,
+    /// Changed here and not yet stored in that scanner.
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -169,6 +194,39 @@ impl Settings {
         serde_json::from_value(base).unwrap_or_else(|_| self.clone())
     }
 
+    /// The mount a scan taken by `scanner` is built with: the processing
+    /// choices from here, the calibration of that scanner. A scan of no known
+    /// scanner (recorded before scanners were told apart, or imported) gets
+    /// the active one's.
+    pub fn mount_for(&self, scanner: Option<&str>) -> Mount {
+        let mut m = self.mount.clone();
+        if let Some(s) = scanner {
+            if self.device.active.as_deref() != Some(s) {
+                if let Some(r) = self.device.scanners.get(s) {
+                    r.calib.apply_to(&mut m);
+                }
+            }
+        }
+        m
+    }
+
+    /// Copies the mount's calibration into the active scanner's record, so
+    /// the two never disagree.
+    pub fn sync_active_scanner(&mut self) {
+        if let Some(a) = self.device.active.clone() {
+            let r = self.device.scanners.entry(a).or_default();
+            r.calib = DeviceCalib::from_mount(&self.mount);
+            r.pending = self.device.calib_pending;
+        }
+    }
+
+    /// Whether any scanner's calibration differs between the two.
+    pub fn calibrations_differ(&self, other: &Settings) -> bool {
+        let a = self.device.scanners.iter().map(|(k, v)| (k, &v.calib));
+        let b = other.device.scanners.iter().map(|(k, v)| (k, &v.calib));
+        !a.eq(b)
+    }
+
     /// The half-sweep actually sent to the device.
     pub fn sweep_degrees(&self) -> f64 {
         if self.scan.sweep_deg > 0.0 {
@@ -201,5 +259,53 @@ fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
             }
         }
         (b, p) => *b = p.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_scanners() -> Settings {
+        let mut s = Settings::default();
+        s.device.active = Some("A".into());
+        s.mount.lidar_rotation = 161.95;
+        s.mount.scan_tilt = -1.63;
+        s.sync_active_scanner();
+        let mut b = DeviceCalib::from_mount(&s.mount);
+        b.lidar_rotation = 162.59;
+        b.scan_tilt = -0.2;
+        s.device.scanners.insert("B".into(), ScannerRecord { calib: b, pending: false });
+        s
+    }
+
+    #[test]
+    fn each_scan_is_built_with_its_scanners_calibration() {
+        let mut s = two_scanners();
+        assert_eq!(s.mount_for(Some("A")).lidar_rotation, 161.95);
+        let b = s.mount_for(Some("B"));
+        assert_eq!((b.lidar_rotation, b.scan_tilt), (162.59, -0.2));
+        // Unknown or unrecorded scanners get the active one's.
+        assert_eq!(s.mount_for(None).lidar_rotation, 161.95);
+        assert_eq!(s.mount_for(Some("C")).lidar_rotation, 161.95);
+        // Processing choices are the app's, whichever scanner.
+        s.mount.max_range = 5000.0;
+        assert_eq!(s.mount_for(Some("B")).max_range, 5000.0);
+    }
+
+    #[test]
+    fn a_patch_reaches_one_scanner_and_survives_a_round_trip() {
+        let s = two_scanners();
+        let patched = s.merged(&serde_json::json!({ "device": { "scanners": { "B": { "calib": { "scanTilt": -0.3 }, "pending": true } } } }));
+        assert_eq!(patched.device.scanners["B"].calib.scan_tilt, -0.3);
+        assert_eq!(patched.device.scanners["B"].calib.lidar_rotation, 162.59);
+        assert!(patched.device.scanners["B"].pending);
+        assert_eq!(patched.device.scanners["A"], s.device.scanners["A"]);
+        assert!(patched.calibrations_differ(&s));
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&patched).unwrap()).unwrap();
+        assert_eq!(back, patched);
+        // Settings written before scanners were told apart still load.
+        let old: Settings = serde_json::from_str(r#"{"device":{"calibPending":true},"mount":{"scanTilt":-1.6}}"#).unwrap();
+        assert!(old.device.active.is_none() && old.device.scanners.is_empty() && old.device.calib_pending);
     }
 }

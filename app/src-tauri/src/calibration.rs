@@ -59,6 +59,12 @@ pub struct CalibResult {
     pub rotation: f64,
     pub spacing: f64,
     pub tilt: f64,
+    /// Where the fit started: the calibration in force for that scanner.
+    pub rotation_before: f64,
+    pub spacing_before: f64,
+    pub tilt_before: f64,
+    /// Chip serial of the scanner whose scan this was, set by the caller.
+    pub scanner: Option<String>,
     /// The calibration scan's own range drift (mm per m^2 per minute); not
     /// part of the rig's calibration, reported for information.
     pub range_drift: f64,
@@ -711,6 +717,10 @@ pub fn calibrate(cap: &Capture, base: &Mount, progress: Progress, cancelled: IsC
         rotation: x[0],
         spacing: x[1],
         tilt: x[2],
+        rotation_before: x0[0],
+        spacing_before: x0[1],
+        tilt_before: x0[2],
+        scanner: None,
         range_drift: x[3],
         range_at_3m_before: geometry::range_error_at(range_start.as_deref(), 3000.0),
         range_at_3m_after: geometry::range_error_at(range_now.as_deref(), 3000.0),

@@ -367,11 +367,13 @@ pub fn mesh_key(core: &CoreRef, scans: &[String]) -> String {
     let s = core.settings.read();
     let mut ids = scans.to_vec();
     ids.sort();
-    let mut key = format!("{:x}|{}|{}|{}|{}", s.mount.fingerprint(), s.mesh.quality, s.mesh.trim, s.mesh.budget, s.mesh.smooth);
+    let mut key = format!("{}|{}|{}|{}", s.mesh.quality, s.mesh.trim, s.mesh.budget, s.mesh.smooth);
     drop(s);
     for id in &ids {
         let p = pose_of(core, id);
-        key.push_str(&format!("|{id}:{:.3},{:.3},{:.3},{:.4}", p[3], p[7], p[11], p[0] + p[5]));
+        let meta = core.library.lock().get(id).cloned();
+        let fp = meta.map(|m| core.mount_for(&m).fingerprint()).unwrap_or(0);
+        key.push_str(&format!("|{id}:{fp:x}:{:.3},{:.3},{:.3},{:.4}", p[3], p[7], p[11], p[0] + p[5]));
     }
     key
 }
@@ -488,7 +490,8 @@ pub fn calibrate_start(core: &CoreRef, id: &str) -> Result<(), String> {
         .spawn(move || {
             let res = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|data| {
                 let cap = Capture::from_bytes(&data);
-                let base = core.settings.read().mount.clone();
+                // From the calibration of the scanner that took it, and for it.
+                let base = core.mount_for(&meta);
                 let cancel = core.calib_cancel.clone();
                 calibration::calibrate(
                     &cap,
@@ -496,6 +499,10 @@ pub fn calibrate_start(core: &CoreRef, id: &str) -> Result<(), String> {
                     &|stage, fraction| core.emit("calib", CalibEvent::Progress { stage, fraction }),
                     &|| cancel.load(Ordering::Relaxed),
                 )
+                .map(|mut r| {
+                    r.scanner = meta.scanner.clone();
+                    r
+                })
                 .map_err(|e| match e {
                     calibration::CalibError::Cancelled => "cancelled".to_string(),
                     calibration::CalibError::NoSweep => "no-sweep".to_string(),
@@ -557,6 +564,7 @@ pub fn import_files(core: &CoreRef, paths: &[String]) -> (Vec<String>, Vec<Strin
             pose: util::identity4(),
             microstep: None,
             range_drift: None,
+            scanner: None,
             source_name: src.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()),
             bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
         };

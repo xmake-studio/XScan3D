@@ -51,6 +51,10 @@ pub struct ScanMeta {
     /// Cached range drift fit for this scan.
     #[serde(default)]
     pub range_drift: Option<DriftFit>,
+    /// Chip serial of the scanner that took it, whose calibration it is
+    /// built with; None when not known.
+    #[serde(default)]
+    pub scanner: Option<String>,
     #[serde(default)]
     pub source_name: Option<String>,
     #[serde(default)]

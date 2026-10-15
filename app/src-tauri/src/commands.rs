@@ -141,6 +141,32 @@ pub fn scans_delete(core: Core<'_>, ids: Vec<String>) {
     core.emit_library();
 }
 
+/// Says which scanner took the given scans (a group stands for its members),
+/// so they are built with its calibration; None forgets it.
+#[tauri::command]
+pub fn scans_set_scanner(core: Core<'_>, ids: Vec<String>, scanner: Option<String>) {
+    let scans = jobs::resolve(&core, &ids);
+    {
+        let mut lib = core.library.lock();
+        for id in &scans {
+            if let Some(m) = lib.get_mut(id) {
+                m.scanner = scanner.clone();
+            }
+        }
+    }
+    {
+        let mut cache = core.clouds.lock();
+        for id in &scans {
+            cache.remove(id);
+        }
+    }
+    *core.mesh.lock() = None;
+    core.save_library();
+    core.emit_library();
+    let v = core.geometry_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    core.emit("geometry", v);
+}
+
 #[tauri::command]
 pub fn scans_ungroup(core: Core<'_>, ids: Vec<String>) {
     let scans = jobs::resolve(&core, &ids);
@@ -279,11 +305,34 @@ pub struct CalibApply {
     spacing: f64,
     tilt: f64,
     range_error: Option<Vec<f64>>,
+    /// The scanner the calibration scan came from; None for the active one.
+    #[serde(default)]
+    scanner: Option<String>,
 }
 
 #[tauri::command]
 pub fn calibrate_apply(core: Core<'_>, fit: CalibApply) -> Settings {
     let has_range = fit.range_error.is_some();
+    // A scanner other than the active one keeps the fit in its record until
+    // it is plugged in again, when it is written to it.
+    let other = {
+        let s = core.settings.read();
+        fit.scanner
+            .as_ref()
+            .filter(|sc| s.device.active.as_deref() != Some(sc.as_str()))
+            .and_then(|sc| s.device.scanners.get(sc).map(|r| (sc.clone(), r.calib.clone())))
+    };
+    if let Some((serial, mut calib)) = other {
+        calib.lidar_rotation = fit.rotation;
+        calib.emitter_spacing = fit.spacing;
+        calib.scan_tilt = fit.tilt;
+        if fit.range_error.is_some() {
+            calib.range_error = fit.range_error;
+        }
+        return core.update_settings(&serde_json::json!({
+            "device": { "scanners": { serial: { "calib": calib, "pending": true } } }
+        }));
+    }
     core.update_settings(&serde_json::json!({
         "mount": {
             "lidarRotation": fit.rotation,

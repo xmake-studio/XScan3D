@@ -1,7 +1,7 @@
 <script lang="ts">
   import { fade, fly } from "svelte/transition";
   import { B } from "../api";
-  import { bytes, fixed } from "../format";
+  import { bytes, fixed, scannerName } from "../format";
   import { t } from "../i18n.svelte";
   import {
     app, applyCalibration, calibrationScan, scanTitle, startCalibration, updateSettings,
@@ -235,6 +235,9 @@
             <div class="lbl">
               {t("settings.calibrateTitle")}
               <div class="hint">{t("settings.calibrateBody")}</div>
+              {#if app.calib.result?.scanner}
+                <div class="hint">{t("settings.calibFor", { name: scannerName(app.calib.result.scanner) })}</div>
+              {/if}
             </div>
           </div>
           {#if app.calib.running}
@@ -250,9 +253,9 @@
             <table>
               <thead><tr><th></th><th>{t("settings.calibNow")}</th><th>{t("settings.calibFitted")}</th></tr></thead>
               <tbody>
-                <tr><td>{t("settings.roll")}</td><td>{fixed(m.lidarRotation, 2)}°</td><td class="new">{fixed(r.rotation, 2)}°</td></tr>
-                <tr><td>{t("settings.spacing")}</td><td>{fixed(m.emitterSpacing, 1)} {t("common.mm")}</td><td class="new">{fixed(r.spacing, 1)} {t("common.mm")}</td></tr>
-                <tr><td>{t("settings.tilt")}</td><td>{fixed(m.scanTilt, 2)}°</td><td class="new">{fixed(r.tilt, 2)}°</td></tr>
+                <tr><td>{t("settings.roll")}</td><td>{fixed(r.rotationBefore, 2)}°</td><td class="new">{fixed(r.rotation, 2)}°</td></tr>
+                <tr><td>{t("settings.spacing")}</td><td>{fixed(r.spacingBefore, 1)} {t("common.mm")}</td><td class="new">{fixed(r.spacing, 1)} {t("common.mm")}</td></tr>
+                <tr><td>{t("settings.tilt")}</td><td>{fixed(r.tiltBefore, 2)}°</td><td class="new">{fixed(r.tilt, 2)}°</td></tr>
                 <tr><td>{t("settings.calibRange")}</td><td>{fixed(r.rangeAt3mBefore, 1)} {t("common.mm")}</td><td class="new">{fixed(r.rangeAt3mAfter, 1)} {t("common.mm")}</td></tr>
                 <tr class="sub"><td colspan="3">{t("settings.calibErrors")}</td></tr>
                 <tr><td>{t("settings.calibPlanes")}</td><td>{fixed(r.before.planes, 2)}</td><td class="new">{fixed(r.after.planes, 2)}</td></tr>
@@ -274,7 +277,10 @@
         </div>
 
         <div class="card">
-          <div class="card-title">{t("settings.geometry")}</div>
+          <div class="card-title">
+            {t("settings.geometry")}{#if app.settings.device.active}
+              <span class="muted">· {t("settings.scannerName", { name: scannerName(app.settings.device.active) })}</span>{/if}
+          </div>
           <div class="store {calibStore}">
             <Icon name="usb" size={13} stroke={2} />
             <span>{t(`settings.calibStore.${calibStore}`)}</span>

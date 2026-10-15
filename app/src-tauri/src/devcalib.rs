@@ -61,6 +61,17 @@ impl DeviceCalib {
         }
     }
 
+    /// Puts this calibration into a mount, leaving the processing choices.
+    pub fn apply_to(&self, m: &mut Mount) {
+        m.lidar_rotation = self.lidar_rotation;
+        m.lidar_reverse = self.lidar_reverse;
+        m.emitter_spacing = self.emitter_spacing;
+        m.scan_tilt = self.scan_tilt;
+        m.flip_upright = self.flip_upright;
+        m.beam_offset = self.beam_offset;
+        m.range_error = self.range_error.clone();
+    }
+
     /// The settings patch that puts this calibration into the mount.
     pub fn mount_patch(&self) -> serde_json::Value {
         serde_json::json!({
@@ -148,6 +159,11 @@ pub fn on_event(core: &CoreRef, e: &str) {
 }
 
 fn on_device_calib(core: &CoreRef, blob: &[u8]) {
+    // Whatever is compared below must be this scanner's own calibration.
+    let serial = core.device.lock().link.as_ref().and_then(|l| l.serial.clone());
+    if let Some(s) = serial {
+        core.activate_scanner(&s);
+    }
     let held = if blob.is_empty() { None } else { DeviceCalib::from_blob(blob) };
     let (local, pending) = {
         let s = core.settings.read();

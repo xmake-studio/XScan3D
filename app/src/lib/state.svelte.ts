@@ -465,10 +465,16 @@ export async function startCalibration() {
   }
 }
 
+/** Says which scanner took these library items, so their scans are built
+ * with its calibration. */
+export async function setScanner(ids: string[], scanner: string | null) {
+  await B().scansSetScanner(ids, scanner);
+}
+
 export async function applyCalibration() {
   const r = app.calib.result;
   if (!r) return;
-  app.settings = await B().calibrateApply({ rotation: r.rotation, spacing: r.spacing, tilt: r.tilt, rangeError: r.rangeError });
+  app.settings = await B().calibrateApply({ rotation: r.rotation, spacing: r.spacing, tilt: r.tilt, rangeError: r.rangeError, scanner: r.scanner });
   app.calib = { running: false, stage: null, fraction: 0, result: null, scan: null };
   toast(t("settings.applied"), "success");
 }

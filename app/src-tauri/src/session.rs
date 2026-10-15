@@ -61,6 +61,8 @@ pub struct ActiveScan {
     stop_requested: bool,
     last_flush: Instant,
     pending_points: Vec<([f32; 3], f32, f32)>,
+    /// Chip serial of the scanner recording it.
+    scanner: Option<String>,
 }
 
 #[derive(Default)]
@@ -128,6 +130,7 @@ pub fn start(core: &CoreRef) -> Result<ScanProgress, String> {
     let final_path = root.join("scans").join(format!("{id}.bin"));
     let part_path = root.join("scans").join(format!("{id}.bin.part"));
     let file = File::create(&part_path).map_err(|e| format!("io: {e}"))?;
+    let scanner = core.device.lock().link.as_ref().and_then(|l| l.serial.clone());
     st.seq += 1;
     let seq = st.seq;
     st.active = Some(ActiveScan {
@@ -153,6 +156,7 @@ pub fn start(core: &CoreRef) -> Result<ScanProgress, String> {
         stop_requested: false,
         last_flush: Instant::now(),
         pending_points: Vec::with_capacity(64),
+        scanner,
     });
     drop(st);
     // The recording is already running, so the config record the firmware
@@ -359,12 +363,12 @@ fn finish(core: &CoreRef, complete: bool) {
         match st.active.as_mut() {
             Some(a) if a.phase != Phase::Finishing => {
                 a.phase = Phase::Finishing;
-                Some((a.id.clone(), a.writer.take(), a.cap.clone(), a.part_path.clone(), a.final_path.clone(), a.created.clone(), a.sweep_deg))
+                Some((a.id.clone(), a.writer.take(), a.cap.clone(), a.part_path.clone(), a.final_path.clone(), a.created.clone(), a.sweep_deg, a.scanner.clone()))
             }
             _ => None,
         }
     };
-    let Some((id, writer, cap, part, fin, created, sweep)) = taken else { return };
+    let Some((id, writer, cap, part, fin, created, sweep, scanner)) = taken else { return };
     if let Some(p) = progress_of(core) {
         core.emit("scan", p);
     }
@@ -377,7 +381,7 @@ fn finish(core: &CoreRef, complete: bool) {
             }
             let path = if std::fs::rename(&part, &fin).is_ok() { fin } else { part };
             let file = format!("scans/{}", path.file_name().unwrap().to_string_lossy());
-            let mount = core.settings.read().mount.clone();
+            let mount = core.settings.read().mount_for(scanner.as_deref());
             let mut meta = ScanMeta {
                 id: id.clone(),
                 name: None,
@@ -392,6 +396,7 @@ fn finish(core: &CoreRef, complete: bool) {
                 pose: crate::util::identity4(),
                 microstep: None,
                 range_drift: None,
+                scanner,
                 source_name: None,
                 bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             };

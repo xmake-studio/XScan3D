@@ -86,6 +86,7 @@ pub fn run() {
             commands::scan_rename,
             commands::scans_delete,
             commands::scans_ungroup,
+            commands::scans_set_scanner,
             commands::thumbnail_save,
             commands::thumbnail,
             commands::import_files,

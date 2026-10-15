@@ -39,6 +39,7 @@ export interface Backend {
   scanRename(id: string, name: string | null): Promise<void>;
   scansDelete(ids: string[]): Promise<void>;
   scansUngroup(ids: string[]): Promise<void>;
+  scansSetScanner(ids: string[], scanner: string | null): Promise<void>;
   thumbnailSave(id: string, png: Uint8Array): Promise<void>;
   thumbnail(id: string): Promise<ArrayBuffer>;
   importFiles(paths: string[]): Promise<{ added: string[]; failed: string[] }>;
@@ -54,7 +55,7 @@ export interface Backend {
   meshData(): Promise<ArrayBuffer>;
   calibrateStart(id: string): Promise<void>;
   calibrateCancel(): Promise<void>;
-  calibrateApply(fit: { rotation: number; spacing: number; tilt: number; rangeError: number[] | null }): Promise<Settings>;
+  calibrateApply(fit: { rotation: number; spacing: number; tilt: number; rangeError: number[] | null; scanner: string | null }): Promise<Settings>;
   on<K extends keyof Events>(event: K, fn: (payload: Events[K]) => void): Promise<Unlisten>;
   // Dialogs and shell.
   pickFiles(): Promise<string[]>;
@@ -97,6 +98,7 @@ async function tauriBackend(): Promise<Backend> {
     scanRename: (id, name) => invoke("scan_rename", { id, name }),
     scansDelete: (ids) => invoke("scans_delete", { ids }),
     scansUngroup: (ids) => invoke("scans_ungroup", { ids }),
+    scansSetScanner: (ids, scanner) => invoke("scans_set_scanner", { ids, scanner }),
     thumbnailSave: (id, png) => invoke("thumbnail_save", png, { headers: { "x-scan-id": id } }),
     thumbnail: (id) => invoke("thumbnail", { id }),
     importFiles: (paths) => invoke("import_files", { paths }),

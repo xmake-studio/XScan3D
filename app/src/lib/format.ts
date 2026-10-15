@@ -42,6 +42,11 @@ export function dateTime(iso: string): string {
   });
 }
 
+/** A scanner's short name: the end of its chip serial. */
+export function scannerName(serial: string): string {
+  return serial.slice(-4).toUpperCase();
+}
+
 export function fixed(v: number, digits = 1): string {
   return v.toLocaleString(locale(), { maximumFractionDigits: digits, minimumFractionDigits: digits });
 }

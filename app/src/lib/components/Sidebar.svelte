@@ -2,10 +2,10 @@
   import { flip } from "svelte/animate";
   import { fly, slide } from "svelte/transition";
   import { B } from "../api";
-  import { compact } from "../format";
+  import { compact, scannerName } from "../format";
   import { t } from "../i18n.svelte";
   import {
-    app, deleteItems, mergeSelection, openFiles, renameItem, select, startCalibration, ungroupItems,
+    app, deleteItems, mergeSelection, openFiles, renameItem, select, setScanner, startCalibration, ungroupItems,
   } from "../state.svelte";
   import { tip } from "../tooltip";
   import type { LibraryItem } from "../types";
@@ -52,6 +52,19 @@
           void startCalibration();
         },
       });
+    // Which scanner took them: its calibration is the one they are built with.
+    const chosen = app.items.filter((x) => ids.includes(x.id));
+    const scans = chosen.flatMap((x) => x.scans);
+    const serials = Object.keys(app.settings.device.scanners ?? {});
+    if (serials.length && scans.length && scans.every((s) => s.kind !== "ply"))
+      serials.forEach((serial, i) =>
+        items.push({
+          label: t("library.takenBy", { name: scannerName(serial) }),
+          icon: scans.every((s) => s.scanner === serial) ? "check" : "usb",
+          separator: i === 0,
+          run: () => void setScanner(ids, serial),
+        }),
+      );
     if (app.items.some((x) => ids.includes(x.id) && x.kind === "group"))
       items.push({ label: t("library.ungroup"), icon: "unlink", run: () => ungroupItems(ids) });
     items.push({ label: t("library.remove"), icon: "trash", danger: true, separator: true, run: () => deleteItems(ids) });
