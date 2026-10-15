@@ -6,6 +6,15 @@
 //! Poisson that usually goes wrong, and here it is known exactly -- solve,
 //! then trim away the surface no measurement supports (Poisson closes
 //! everything), drop the crumbs that trimming leaves, and optionally smooth.
+//!
+//! The trim is measured in gaps of the scan itself. A lidar sweep is dense
+//! along the shaft (slices a millimetre or two apart) and sparse along each
+//! slice (one return every LIDAR_STEP_DEG, 25 mm at 2 m, 40 mm at 3 m), so
+//! the median spacing describes only the dense direction: a trim of a few
+//! spacings cut the surface open between every pair of returns on anything
+//! a couple of metres away. Here the gap is the larger of the spacing and
+//! the sparse step at that sample's range, so a trim of N closes holes up to
+//! about 2N such gaps across at any distance.
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -22,7 +31,8 @@ pub struct MeshParams {
     pub cell_mm: f64,
     pub samples_per_node: f32,
     pub point_weight: f32,
-    /// Drop surface further than this many point spacings from any sample.
+    /// Drop surface further than this many scan gaps (see the module notes)
+    /// from any sample; 0 keeps Poisson's closed surface whole.
     pub trim: f64,
     /// Thin the input to about this many points first (0 = no limit).
     pub budget: usize,
@@ -174,16 +184,38 @@ fn oriented_normals(p: &[V3], scan: &[u16], origins: &[V3], tree: &KdTree, k: us
         .collect()
 }
 
-/// Keeps triangles whose three corners are within `max_dist` of a sample, then
-/// compacts the vertex array.
-fn trim_to_samples(verts: Vec<[f32; 3]>, tris: Vec<[u32; 3]>, tree: &KdTree, max_dist: f64) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
-    if max_dist <= 0.0 || tris.is_empty() {
+/// Angle between neighbouring returns in the lidar's own plane: the sparse
+/// direction of a sweep (a frame of 8 returns spans about 5 degrees).
+pub const LIDAR_STEP_DEG: f64 = 0.72;
+
+/// The scan's sampling gap around each sample: the median spacing, or the
+/// lidar's angular step at the sample's range, whichever is larger.
+fn sample_gaps(p: &[V3], scan: &[u16], origins: &[V3], spacing: f64) -> Vec<f64> {
+    let step = LIDAR_STEP_DEG.to_radians();
+    p.par_iter()
+        .zip(scan.par_iter())
+        .map(|(q, &k)| {
+            let o = origins.get(k as usize).copied().unwrap_or([0.0; 3]);
+            (util::norm(util::sub(*q, o)) * step).max(spacing)
+        })
+        .collect()
+}
+
+/// Keeps triangles whose three corners lie within `trim` gaps of their nearest
+/// sample, then compacts the vertex array.
+fn trim_to_samples(verts: Vec<[f32; 3]>, tris: Vec<[u32; 3]>, tree: &KdTree, gaps: &[f64], trim: f64) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    if trim <= 0.0 || tris.is_empty() {
         return (verts, tris);
     }
-    let md2 = max_dist * max_dist;
     let keep: Vec<bool> = verts
         .par_iter()
-        .map(|v| tree.nearest([v[0] as f64, v[1] as f64, v[2] as f64], md2).is_some())
+        .map_init(Vec::new, |buf, v| {
+            tree.knn([v[0] as f64, v[1] as f64, v[2] as f64], 1, buf);
+            buf.first().map_or(false, |&(j, d2)| {
+                let lim = trim * gaps[j];
+                d2 < lim * lim
+            })
+        })
         .collect();
     let tris: Vec<[u32; 3]> = tris.into_par_iter().filter(|t| keep[t[0] as usize] && keep[t[1] as usize] && keep[t[2] as usize]).collect();
     compact(verts, tris)
@@ -365,7 +397,8 @@ pub fn reconstruct(
         return Err("cancelled".into());
     }
     progress(MeshStage::Cleaning);
-    let (verts, tris) = trim_to_samples(raw.verts, raw.tris, &tree, s * prm.trim);
+    let gaps = sample_gaps(&p, &sc, origins, s);
+    let (verts, tris) = trim_to_samples(raw.verts, raw.tris, &tree, &gaps, prm.trim);
     let (mut verts, tris) = drop_crumbs(verts, tris);
     laplacian_smooth(&mut verts, &tris, prm.smooth_iters);
     let normals = vertex_normals(&verts, &tris);
@@ -376,4 +409,58 @@ pub fn reconstruct(
         return Err("the reconstruction produced no surface".into());
     }
     Ok((Mesh { verts, normals, tris }, info))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Area of the surface within 5 mm of the wall plane y = 2400, inside a
+    /// square of half-width `half` around the wall's middle.
+    fn wall_area(m: &Mesh, half: f64) -> f64 {
+        m.tris
+            .iter()
+            .map(|t| {
+                let p: Vec<V3> = t.iter().map(|&i| m.verts[i as usize]).map(|v| [v[0] as f64, v[1] as f64, v[2] as f64]).collect();
+                let c = util::scale(util::add(util::add(p[0], p[1]), p[2]), 1.0 / 3.0);
+                if (c[1] - 2400.0).abs() > 5.0 || c[0].abs() > half || c[2].abs() > half {
+                    return 0.0;
+                }
+                0.5 * util::norm(util::cross(util::sub(p[1], p[0]), util::sub(p[2], p[0])))
+            })
+            .sum()
+    }
+
+    #[test]
+    fn trim_follows_the_scan_gaps_not_the_dense_direction() {
+        // A 2 m wall 2.4 m from the scanner, sampled the way a sweep samples
+        // it: rows one lidar step (30 mm here) apart, 3 mm apart along a row,
+        // with a 300 mm square never measured in the middle.
+        let mut pts = Vec::new();
+        let mut z: f64 = -1000.0;
+        while z <= 1000.0 {
+            let mut x: f64 = -1000.0;
+            while x <= 1000.0 {
+                if x.abs() > 150.0 || z.abs() > 150.0 {
+                    pts.push([x, 2400.0, z]);
+                }
+                x += 3.0;
+            }
+            z += 30.0;
+        }
+        let scan = vec![0u16; pts.len()];
+        let mesh = |trim: f64| {
+            let prm = MeshParams::preset("medium", trim, 0, 0);
+            reconstruct(&pts, &scan, &[[0.0; 3]], &prm, &|_| {}, &|| false).unwrap().0
+        };
+        // A few gaps: the wall is whole between rows, the hole stays open.
+        let m = mesh(3.0);
+        let whole = wall_area(&m, 900.0) / 1e6;
+        assert!(whole > 0.95 * (3.24 - 0.09), "wall area {whole} m2");
+        // The middle of the hole is 150 mm from any sample, over 3 gaps.
+        assert!(wall_area(&m, 50.0) < 0.1 * 0.01e6, "the hole was filled at trim 3");
+        // More gaps than the hole is wide: filled.
+        let m = mesh(8.0);
+        assert!(wall_area(&m, 50.0) > 0.9 * 0.01e6, "the hole stayed open at trim 8");
+    }
 }
