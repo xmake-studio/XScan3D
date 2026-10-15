@@ -20,7 +20,7 @@ const DEFAULT_SETTINGS: Settings = {
     rangeError: [24.7, 3.5, 2, 827, 3561, -0.08861, -0.01755, -0.003573, 0.1086, -0.01447, 0.01174, -0.1113, 0.01858, -0.003672, 0.0393, 0.06772, 0.01801],
   },
   view: { colorMode: "height", pointSize: 1, grid: true, edl: true, camera: "orbit", flySpeed: 1500 },
-  mesh: { enabled: true, quality: "high", trim: 3, budget: 2500000, smooth: 0 },
+  mesh: { enabled: true, quality: "high", trimGaps: 8, budget: 2500000, smooth: 0 },
   merge: { mode: "auto", yawHint: 0, voxel: 40, ignoreFoliage: true },
   flyHintSeen: false,
 };

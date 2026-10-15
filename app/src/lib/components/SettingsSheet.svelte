@@ -372,7 +372,7 @@
             </div>
             <div class="row">
               <div class="lbl">{t("settings.trim")}<div class="hint">{t("settings.trimHint")}</div></div>
-              <NumberField value={s.mesh.trim} min={0} max={20} step={0.5} digits={1} unit="×" onchange={(v) => updateSettings({ mesh: { trim: v } })} />
+              <NumberField value={s.mesh.trimGaps} min={0} max={40} step={1} digits={0} unit="×" onchange={(v) => updateSettings({ mesh: { trimGaps: v } })} />
             </div>
             <div class="row">
               <div class="lbl">{t("settings.budget")}</div>

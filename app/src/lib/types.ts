@@ -39,7 +39,7 @@ export interface Settings {
   };
   mount: Mount;
   view: { colorMode: ColorMode; pointSize: number; grid: boolean; edl: boolean; camera: CamMode; flySpeed: number };
-  mesh: { enabled: boolean; quality: Quality; trim: number; budget: number; smooth: number };
+  mesh: { enabled: boolean; quality: Quality; trimGaps: number; budget: number; smooth: number };
   merge: { mode: "auto" | "small" | "hint"; yawHint: number; voxel: number; ignoreFoliage: boolean };
   flyHintSeen: boolean;
 }

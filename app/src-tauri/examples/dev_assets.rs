@@ -28,7 +28,7 @@ fn main() {
         if k == 0 {
             let pts = util::to_f64(&e.xyz);
             let scan = vec![0u16; pts.len()];
-            let prm = meshing::MeshParams::preset("medium", 3.0, 2_500_000, 0);
+            let prm = meshing::MeshParams::preset("medium", 8.0, 2_500_000, 0);
             let (mesh, info) = meshing::reconstruct(&pts, &scan, &[[0.0; 3]], &prm, &|_| {}, &|| false).unwrap();
             std::fs::write(out.join("mesh.xsm"), jobs::mesh_bytes(&mesh)).unwrap();
             println!("mesh: {} tris", info.tris);

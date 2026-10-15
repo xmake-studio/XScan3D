@@ -367,7 +367,7 @@ pub fn mesh_key(core: &CoreRef, scans: &[String]) -> String {
     let s = core.settings.read();
     let mut ids = scans.to_vec();
     ids.sort();
-    let mut key = format!("{}|{}|{}|{}", s.mesh.quality, s.mesh.trim, s.mesh.budget, s.mesh.smooth);
+    let mut key = format!("{}|{}|{}|{}", s.mesh.quality, s.mesh.trim_gaps, s.mesh.budget, s.mesh.smooth);
     drop(s);
     for id in &ids {
         let p = pose_of(core, id);
@@ -403,7 +403,7 @@ pub fn mesh_start(core: &CoreRef, ids: &[String]) -> Result<String, String> {
                     origins.push([t[3], t[7], t[11]]);
                 }
                 let s = core.settings.read().mesh.clone();
-                let prm = MeshParams::preset(&s.quality, s.trim, s.budget, s.smooth);
+                let prm = MeshParams::preset(&s.quality, s.trim_gaps, s.budget, s.smooth);
                 let cancel = core.mesh_cancel.clone();
                 meshing::reconstruct(&pts, &scan_idx, &origins, &prm, &|stage| core.emit("mesh", MeshEvent::Progress { stage }), &|| {
                     cancel.load(Ordering::Relaxed)

@@ -106,15 +106,18 @@ pub struct MeshSettings {
     pub enabled: bool,
     /// "medium" | "high" | "max"
     pub quality: String,
-    /// Trim distance in point spacings.
-    pub trim: f64,
+    /// Trim distance in scan gaps (see meshing.rs); 0 keeps the surface
+    /// closed. A new name for a new unit: the old `trim` counted median point
+    /// spacings, a few millimetres, and a saved value of it would mean far
+    /// less now.
+    pub trim_gaps: f64,
     pub budget: usize,
     pub smooth: u32,
 }
 
 impl Default for MeshSettings {
     fn default() -> Self {
-        MeshSettings { enabled: true, quality: "high".into(), trim: 3.0, budget: 2_500_000, smooth: 0 }
+        MeshSettings { enabled: true, quality: "high".into(), trim_gaps: 8.0, budget: 2_500_000, smooth: 0 }
     }
 }
 
@@ -307,5 +310,8 @@ mod tests {
         // Settings written before scanners were told apart still load.
         let old: Settings = serde_json::from_str(r#"{"device":{"calibPending":true},"mount":{"scanTilt":-1.6}}"#).unwrap();
         assert!(old.device.active.is_none() && old.device.scanners.is_empty() && old.device.calib_pending);
+        // A trim saved in the old unit is not read as the new one.
+        let old: Settings = serde_json::from_str(r#"{"mesh":{"trim":3.0,"quality":"max"}}"#).unwrap();
+        assert_eq!((old.mesh.trim_gaps, old.mesh.quality.as_str()), (8.0, "max"));
     }
 }
