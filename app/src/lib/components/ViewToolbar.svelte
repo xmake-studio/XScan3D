@@ -161,7 +161,7 @@
 <style>
   .tools {
     position: absolute;
-    top: calc(var(--titlebar) + 2px);
+    top: calc(var(--titlebar) + var(--gap));
     right: var(--gap);
     z-index: 20;
     display: flex;

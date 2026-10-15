@@ -101,7 +101,7 @@
 <style>
   .pill {
     position: absolute;
-    top: calc(var(--titlebar) + 8px);
+    top: calc(var(--titlebar) + var(--gap));
     left: 50%;
     translate: -50% 0;
     z-index: 30;
@@ -187,7 +187,7 @@
   }
   .toasts {
     position: absolute;
-    top: calc(var(--titlebar) + 8px);
+    top: calc(var(--titlebar) + var(--gap));
     left: 50%;
     translate: -50% 0;
     z-index: 60;

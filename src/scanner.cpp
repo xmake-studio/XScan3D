@@ -33,6 +33,13 @@ long Scanner::platformDegToSteps(float deg) const {
   return lroundf(deg * motor_.stepsPerRev() / 360.0f);
 }
 
+// What the count is set to where homing stalls: one backoff short of the
+// sweep's start, so parking backs off exactly SCAN_HOME_BACKOFF.
+long Scanner::homeSteps() const {
+  return platformDegToSteps(-scanDegrees_) -
+         platformDegToSteps(SCAN_HOME_BACKOFF);
+}
+
 // Stop `i` of steps_ intervals, so i == 0 is -scanDegrees_ and i == steps_ is
 // +scanDegrees_. Computed from the index rather than accumulated, so the last
 // stop lands exactly on +scanDegrees_ instead of wherever rounding drifted to.
@@ -498,12 +505,21 @@ void Scanner::startScan() {
   // aborted there, however wide the sweep has been set.
   const float travel =
       max(SCAN_HOME_DEG, 2.0f * scanDegrees_ + SCAN_HOME_BACKOFF + 15.0f);
+  // Then on to the next count in phase with homeSteps(), up to one electrical
+  // cycle further. The field stalls there, so the renumbering at the stop is
+  // by whole cycles and still lands on homeSteps() exactly, leaving exactly
+  // SCAN_HOME_BACKOFF to back off rather than anything up to a cycle more.
+  const long cycle = 4L * motor_.stepsPerRev() / STEP_FULL_STEPS_PER_REV;
+  long target = motor_.currentPosition() - platformDegToSteps(travel);
+  target -= ((target - homeSteps()) % cycle + cycle) % cycle;
   motor_.setMaxSpeed(SCAN_HOME_SPEED);
   motor_.setAcceleration(SCAN_TRAVEL_ACCEL);
-  motor_.move(-platformDegToSteps(travel));
+  motor_.moveTo(target);
   state_   = SCAN_HOMING;
   stateAt_ = millis();
-  emitEvent("homing: driving %.0f deg into the end stop", travel);
+  emitEvent("homing: driving %.0f deg into the end stop",
+            360.0f * (motor_.currentPosition() - target) /
+                motor_.stepsPerRev());
   if (scanMode_ == SCAN_MODE_STEPPED) {
     // The runtime is set by the dwell windows, not by scanTime_, so state it
     // up front rather than letting the operator infer it from the duration
@@ -550,14 +566,16 @@ void Scanner::advanceStateMachine() {
     case SCAN_HOMING:
       if (!motor_.isRunning()) {
         // The field now sits within half an electrical cycle of the stop.
-        // Renumber so that backing off by at least SCAN_HOME_BACKOFF lands on
+        // Renumber so that backing off by SCAN_HOME_BACKOFF lands on
         // -scanDegrees_, shifting the count only by whole electrical cycles:
         // the driver's current table is indexed by the step count, and keeping
         // count and phase in step keeps the microstep error a fixed function
-        // of the reported angle from one scan to the next.
+        // of the reported angle from one scan to the next. Homing stalled in
+        // phase with homeSteps(), so this lands on it exactly; the rounding
+        // only matters if it ever did not, and then backs off further.
         const long cycle = 4L * motor_.stepsPerRev() / STEP_FULL_STEPS_PER_REV;
         const long start = platformDegToSteps(-scanDegrees_);
-        const long want  = start - platformDegToSteps(SCAN_HOME_BACKOFF);
+        const long want  = homeSteps();
         const long pos   = motor_.currentPosition();
         long k = (want - pos) / cycle;
         if (pos + k * cycle > want) k--;   // round toward the stop

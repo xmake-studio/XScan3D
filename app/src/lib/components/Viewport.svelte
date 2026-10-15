@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { fade, scale } from "svelte/transition";
   import { fixed } from "../format";
   import { t } from "../i18n.svelte";
@@ -69,7 +69,9 @@
     const scans = app.visibleScans;
     void app.geometryVersion;
     if (!view.r || app.scan) return;
-    void showScans(scans);
+    // Untracked: with nothing to load it runs through without awaiting and
+    // bumps sceneTick, which would otherwise re-run this effect forever.
+    untrack(() => void showScans(scans));
   });
 
   // The alignment preview: move and tint the scans being reviewed.
@@ -151,7 +153,7 @@
 <style>
   .viewport {
     position: absolute;
-    inset: 0;
+    inset: var(--titlebar) 0 0 0;
     z-index: 0;
   }
   canvas {
@@ -237,7 +239,7 @@
   }
   .loading {
     position: absolute;
-    top: calc(var(--titlebar) + 10px);
+    top: var(--gap);
     left: 50%;
     translate: -50% 0;
     display: flex;

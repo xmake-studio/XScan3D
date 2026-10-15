@@ -152,7 +152,7 @@ static_assert(sizeof(PktCalibHdr) == 13, "PktCalibHdr layout drifted");
 // tether only takes on more twist.
 //
 // With the end stop fitted, the real ceiling is the stop's free travel less
-// SCAN_HOME_BACKOFF and up to one electrical cycle (see scanner.h): a sweep
+// SCAN_HOME_BACKOFF and up to half an electrical cycle (see scanner.h): a sweep
 // wider than that runs into the stop from the other side. The host's automatic
 // sweep is a little over 90 -- enough to close the seam the scan-plane tilt
 // opens -- which leaves plenty of room.

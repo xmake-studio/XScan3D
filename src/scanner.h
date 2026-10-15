@@ -61,11 +61,23 @@
 // A stalled stepper does not stop exactly at the stop: the field has an
 // equilibrium every electrical cycle (4 full steps, 7.2 deg), so the rotor
 // ends up anywhere from pressed against the stop to half a cycle (3.6 deg)
-// short of it, with the field up to half a cycle past it. The backoff must
-// exceed that half cycle so the field is certainly back on the free side and
-// dragging the rotor with it, which is why it is 5 and not 1.
+// short of it, with the field up to half a cycle past it.
+//
+// The backoff is exactly one full step, because every degree spent on it comes
+// off the far end: on rigs whose stop leaves little more free travel than the
+// sweep, a backoff of 5 ran the end of the sweep into the stop and lost steps
+// there. Homing stalls the field in phase with the renumbering (see
+// startScan), so the backoff is this one step and not up to a cycle more.
+//
+// The price is that a full step is less than that half cycle. Where the field
+// stalls more than a step past the stop, the rotor is still pressed against it
+// when the sweep begins and only comes off within the sweep's first 1.8 deg,
+// so the frames from that sliver are stamped with angles the shaft has not
+// reached. The stall phase is the same every scan, so a rig either always does
+// this or never does.
 #define SCAN_HOME_DEG     210.0f   // at least this far into the stop
-#define SCAN_HOME_BACKOFF 5.0f     // at least this far back out of it
+// Exactly this far back out of it: one full step, 1.8 deg.
+#define SCAN_HOME_BACKOFF (360.0f / STEP_FULL_STEPS_PER_REV)
 // Slower than travel: the rotor hits the stop at this speed, and a gentle
 // arrival rings less and bounces the rotor off fewer equilibria.
 #define SCAN_HOME_SPEED   800.0f   // microsteps/s, = 90 deg/s
@@ -168,6 +180,7 @@ class Scanner {
 
   float platformDeg() const;
   long  platformDegToSteps(float deg) const;
+  long  homeSteps() const;   // the count set at the end stop
 
   Stepper  motor_;
   ScanState state_    = SCAN_IDLE;

@@ -94,11 +94,10 @@
     align-items: center;
     z-index: 40;
     padding-left: 10px;
-    /* Solid frosted backing so text stays legible over bright scan points. */
-    background: var(--glass-strong);
-    backdrop-filter: saturate(180%) blur(28px);
-    -webkit-backdrop-filter: saturate(180%) blur(28px);
-    border-bottom: 1px solid var(--glass-border);
+    /* Window chrome in the colour of the scene's sky: the scene starts below
+       it, so the points never run under the text and panels float clear of it. */
+    background: var(--chrome);
+    border-bottom: 1px solid var(--sep);
   }
   .left,
   .right {

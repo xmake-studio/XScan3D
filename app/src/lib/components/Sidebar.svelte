@@ -153,7 +153,7 @@
 <style>
   .side {
     position: absolute;
-    top: calc(var(--titlebar) + 2px);
+    top: calc(var(--titlebar) + var(--gap));
     left: var(--gap);
     bottom: var(--gap);
     width: 300px;
